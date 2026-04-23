@@ -83,7 +83,11 @@ def max_consecutive_above(monthly: pd.DataFrame, threshold: float = 0.0) -> pd.S
         return pd.Series(dtype="int64", name="max_consecutive_above")
 
     df = monthly.sort_values(["wallet", "month"]).copy()
-    month_period = df["month"].dt.to_period("M")
+    # Strip tz before to_period (tz-aware drops tz with a warning).
+    month_ts = df["month"]
+    if getattr(month_ts.dt, "tz", None) is not None:
+        month_ts = month_ts.dt.tz_convert("UTC").dt.tz_localize(None)
+    month_period = month_ts.dt.to_period("M")
 
     prev_month = month_period.groupby(df["wallet"]).shift(1)
     gap_to_prev = (month_period - prev_month).apply(
