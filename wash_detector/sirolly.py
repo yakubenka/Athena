@@ -255,3 +255,27 @@ def detect_wash_clusters(
     ]
     clusters.sort(key=lambda c: (-len(c), sorted(c)))
     return clusters
+
+
+def run_wash_detection(
+    trades_df: pd.DataFrame,
+    *,
+    threshold: float = 0.7,
+    n_iterations: int = 3,
+    min_cluster_size: int = 3,
+    max_hold_hours: float = MAX_HOLD_HOURS_DEFAULT,
+) -> tuple[dict[str, float], list[frozenset[str]]]:
+    """Full Sirolly pipeline: Stage 1 + Stage 2 + Stage 3.
+
+    Returns a ``(final_scores, clusters)`` tuple. The scores dict maps
+    every wallet that appears in ``trades_df`` to its iterated
+    suspicion score in [0, 1]. The cluster list contains groups of
+    wallets flagged as wash farms.
+    """
+    initial = initialize_scores(trades_df, max_hold_hours=max_hold_hours)
+    graph = build_trade_graph(trades_df)
+    final = iterate_scores(initial, graph, n_iterations=n_iterations)
+    clusters = detect_wash_clusters(
+        final, trades_df, threshold=threshold, min_cluster_size=min_cluster_size
+    )
+    return final, clusters
