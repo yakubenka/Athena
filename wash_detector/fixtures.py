@@ -19,7 +19,16 @@ from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 
-TRADE_COLUMNS = ["maker", "taker", "market", "size", "price", "timestamp"]
+TRADE_COLUMNS = [
+    "maker",
+    "taker",
+    "market",
+    "outcome",
+    "taker_side",
+    "size",
+    "price",
+    "timestamp",
+]
 
 
 def wallet_id(n: int) -> str:
@@ -50,6 +59,8 @@ def organic_trades(
                 "maker": maker,
                 "taker": taker,
                 "market": rng.choice(markets),
+                "outcome": rng.choice(["YES", "NO"]),
+                "taker_side": rng.choice(["BUY", "SELL"]),
                 "size": round(rng.uniform(10, 5000), 2),
                 "price": round(rng.uniform(0.05, 0.95), 4),
                 "timestamp": t0 + timedelta(minutes=k * 3),
@@ -87,14 +98,18 @@ def wash_cluster(
     for _ in range(n_round_trips):
         a, b = rng.sample(wallets, 2)
         market = rng.choice(markets)
+        outcome = rng.choice(["YES", "NO"])
         size = round(rng.uniform(500, 2000), 2)
         price = round(rng.uniform(0.2, 0.8), 4)
 
+        # Open: taker buys; close: taker sells (round-trip).
         rows.append(
             {
                 "maker": a,
                 "taker": b,
                 "market": market,
+                "outcome": outcome,
+                "taker_side": "BUY",
                 "size": size,
                 "price": price,
                 "timestamp": t,
@@ -106,6 +121,8 @@ def wash_cluster(
                 "maker": b,
                 "taker": a,
                 "market": market,
+                "outcome": outcome,
+                "taker_side": "SELL",
                 "size": size,
                 "price": round(price + rng.uniform(-0.005, 0.005), 4),
                 "timestamp": t2,
