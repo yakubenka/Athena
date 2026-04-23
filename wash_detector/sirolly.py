@@ -20,6 +20,7 @@ proxy with realised PnL.
 
 from __future__ import annotations
 
+import networkx as nx
 import pandas as pd
 
 MAX_HOLD_HOURS_DEFAULT = 24.0
@@ -107,3 +108,43 @@ def initialize_scores(
 
     score = 0.5 * turnover + 0.5 * pnl_suspicion
     return {wallet: float(s) for wallet, s in score.items()}
+
+
+def build_trade_graph(
+    trades_df: pd.DataFrame,
+    restrict_to: set[str] | None = None,
+) -> nx.Graph:
+    """Build an undirected weighted counterparty graph.
+
+    Nodes are wallet addresses. Each edge carries a ``volume`` attribute
+    equal to the sum of notional (``size * price``) across all trades
+    between the two wallets (order-insensitive).
+
+    When ``restrict_to`` is supplied, only trades whose both participants
+    lie in that set are used, producing the Stage 3 suspected-wallet
+    subgraph. Wallets with no qualifying edges become isolated and are
+    omitted (consistent with ``nx.connected_components`` semantics).
+    """
+    g: nx.Graph = nx.Graph()
+    if trades_df.empty:
+        return g
+
+    working = trades_df.assign(notional=trades_df["size"] * trades_df["price"])
+    if restrict_to is not None:
+        working = working[working["maker"].isin(restrict_to) & working["taker"].isin(restrict_to)]
+    # Drop accidental self-loops — no information in wallet trading with itself.
+    working = working[working["maker"] != working["taker"]]
+    if working.empty:
+        return g
+
+    # Canonicalize each pair so (a, b) and (b, a) aggregate together.
+    pair = working[["maker", "taker"]]
+    lo = pair.min(axis=1)
+    hi = pair.max(axis=1)
+    edges = (
+        working.assign(w_lo=lo, w_hi=hi).groupby(["w_lo", "w_hi"])["notional"].sum().reset_index()
+    )
+
+    for row in edges.itertuples(index=False):
+        g.add_edge(row.w_lo, row.w_hi, volume=float(row.notional))
+    return g
