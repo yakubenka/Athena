@@ -1,0 +1,109 @@
+"""Sirolly et al. (Nov 2025) network-based wash detection — Stage 1.
+
+Stage 1 assigns an initial suspicion score in [0, 1] to each wallet by
+combining two signals:
+
+- **Turnover:** share of a wallet's trades that are followed by another
+  trade on the same market within `max_hold_hours`. Wash farms cycle
+  positions rapidly to inflate volume.
+- **PnL/volume suspicion:** `1 - min(|pnl|/volume * 100, 1)`. Wash traders
+  churn large notional volume with near-zero net cash flow.
+
+Score = 0.5 * turnover + 0.5 * pnl_suspicion.
+
+PnL here is a *proxy*: sum(size*price) as maker minus the same as taker.
+For round-trip wash patterns (A -> B then B -> A at near-equal price),
+each participant's net is ~0. For organic trading the signed flow is
+non-zero on average. Once we have resolved markets we will replace this
+proxy with realised PnL.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+MAX_HOLD_HOURS_DEFAULT = 24.0
+
+
+def _wallet_stats(
+    trades_df: pd.DataFrame, max_hold_hours: float = MAX_HOLD_HOURS_DEFAULT
+) -> pd.DataFrame:
+    """Per-wallet aggregates required by the Stage 1 score.
+
+    Returns a DataFrame indexed by wallet with columns:
+    num_trades, volume, pnl_proxy, rapid_cycles.
+    """
+    if trades_df.empty:
+        return pd.DataFrame(columns=["num_trades", "volume", "pnl_proxy", "rapid_cycles"])
+
+    notional = trades_df["size"] * trades_df["price"]
+    maker_flow = trades_df.assign(amount=notional).groupby("maker")["amount"].sum()
+    taker_flow = trades_df.assign(amount=notional).groupby("taker")["amount"].sum()
+
+    all_wallets = maker_flow.index.union(taker_flow.index)
+    maker_flow = maker_flow.reindex(all_wallets, fill_value=0.0)
+    taker_flow = taker_flow.reindex(all_wallets, fill_value=0.0)
+
+    volume = maker_flow + taker_flow
+    pnl_proxy = maker_flow - taker_flow
+
+    # num_trades per wallet (counts in either role)
+    maker_count = trades_df.groupby("maker").size().reindex(all_wallets, fill_value=0)
+    taker_count = trades_df.groupby("taker").size().reindex(all_wallets, fill_value=0)
+    num_trades = maker_count + taker_count
+
+    rapid = _rapid_cycle_counts(trades_df, max_hold_hours).reindex(all_wallets, fill_value=0)
+
+    stats = pd.DataFrame(
+        {
+            "num_trades": num_trades,
+            "volume": volume,
+            "pnl_proxy": pnl_proxy,
+            "rapid_cycles": rapid,
+        }
+    )
+    stats.index.name = "wallet"
+    return stats
+
+
+def _rapid_cycle_counts(trades_df: pd.DataFrame, max_hold_hours: float) -> pd.Series:
+    """Count consecutive same-market trades per wallet within max_hold_hours.
+
+    Each wallet appears in a trade either as maker or taker; both count
+    as a "touch" on that market at that timestamp. We count how many of
+    those touches are preceded by the same wallet's touch on the same
+    market within the window.
+    """
+    long = pd.concat(
+        [
+            trades_df[["maker", "market", "timestamp"]].rename(columns={"maker": "wallet"}),
+            trades_df[["taker", "market", "timestamp"]].rename(columns={"taker": "wallet"}),
+        ],
+        ignore_index=True,
+    ).sort_values(["wallet", "market", "timestamp"], kind="stable")
+
+    prev_ts = long.groupby(["wallet", "market"])["timestamp"].shift(1)
+    delta = long["timestamp"] - prev_ts
+    threshold = pd.Timedelta(hours=max_hold_hours)
+    rapid_mask = delta.notna() & (delta <= threshold)
+
+    counts = long.loc[rapid_mask].groupby("wallet").size()
+    counts.name = "rapid_cycles"
+    return counts
+
+
+def initialize_scores(
+    trades_df: pd.DataFrame,
+    max_hold_hours: float = MAX_HOLD_HOURS_DEFAULT,
+) -> dict[str, float]:
+    """Compute Stage 1 suspicion scores for all wallets in trades_df."""
+    stats = _wallet_stats(trades_df, max_hold_hours=max_hold_hours)
+    if stats.empty:
+        return {}
+
+    turnover = (stats["rapid_cycles"] / stats["num_trades"].clip(lower=1)).clip(upper=1.0)
+    pnl_vol_ratio = stats["pnl_proxy"].abs() / stats["volume"].clip(lower=1)
+    pnl_suspicion = (1.0 - (pnl_vol_ratio * 100).clip(upper=1.0)).clip(lower=0.0)
+
+    score = 0.5 * turnover + 0.5 * pnl_suspicion
+    return {wallet: float(s) for wallet, s in score.items()}
