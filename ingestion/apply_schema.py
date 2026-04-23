@@ -26,8 +26,7 @@ def main() -> int:
         cur.execute(sql)
         conn.commit()
         cur.execute(
-            "SELECT tablename FROM pg_tables "
-            "WHERE schemaname = 'public' ORDER BY tablename"
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
         )
         tables = [row[0] for row in cur.fetchall()]
 
