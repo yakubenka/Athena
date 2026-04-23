@@ -215,3 +215,43 @@ def iterate_scores(
     for i, node in enumerate(nodes):
         result[node] = float(score_vec[i])
     return result
+
+
+def detect_wash_clusters(
+    scores: dict[str, float],
+    trades_df: pd.DataFrame,
+    threshold: float = 0.7,
+    min_cluster_size: int = 3,
+) -> list[frozenset[str]]:
+    """Sirolly Stage 3: find connected components of suspected wallets.
+
+    A wallet is *suspected* if its score is at or above ``threshold``.
+    The subgraph restricted to suspected wallets is partitioned into
+    connected components; components smaller than ``min_cluster_size``
+    are discarded (a pair of suspected wallets is not enough signal to
+    call a cluster).
+
+    Returns clusters as ``frozenset`` so callers can hash and compare
+    them independently of iteration order. The list itself is sorted
+    by descending cluster size for deterministic ordering.
+    """
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be in [0, 1]")
+    if min_cluster_size < 2:
+        raise ValueError("min_cluster_size must be >= 2")
+
+    suspected = {w for w, s in scores.items() if s >= threshold}
+    if len(suspected) < min_cluster_size:
+        return []
+
+    subgraph = build_trade_graph(trades_df, restrict_to=suspected)
+    if subgraph.number_of_edges() == 0:
+        return []
+
+    clusters = [
+        frozenset(component)
+        for component in nx.connected_components(subgraph)
+        if len(component) >= min_cluster_size
+    ]
+    clusters.sort(key=lambda c: (-len(c), sorted(c)))
+    return clusters
