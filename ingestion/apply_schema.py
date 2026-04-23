@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 import psycopg
-from dotenv import load_dotenv
+
+from config.settings import get_settings
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 def main() -> int:
-    load_dotenv()
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        print("DATABASE_URL not set (see .env.example)", file=sys.stderr)
-        return 1
+    settings = get_settings()
+    dsn = str(settings.database_url)
 
     sql = SCHEMA_PATH.read_text()
     print(f"Applying {SCHEMA_PATH.name} ({len(sql):,} bytes) to {_mask(dsn)}")
