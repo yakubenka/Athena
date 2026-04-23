@@ -21,6 +21,7 @@ proxy with realised PnL.
 from __future__ import annotations
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 
 MAX_HOLD_HOURS_DEFAULT = 24.0
@@ -148,3 +149,69 @@ def build_trade_graph(
     for row in edges.itertuples(index=False):
         g.add_edge(row.w_lo, row.w_hi, volume=float(row.notional))
     return g
+
+
+def iterate_scores(
+    scores: dict[str, float],
+    graph: nx.Graph,
+    n_iterations: int = 3,
+) -> dict[str, float]:
+    """Sirolly Stage 2: redistribute scores along volume-weighted edges.
+
+    Each iteration replaces every wallet's score with the volume-weighted
+    average of its neighbors' scores:
+
+        new[w] = Σ_cp volume(w, cp) * old[cp] / Σ_cp volume(w, cp)
+
+    Wallets with no edges (isolates, or those present in ``scores`` but
+    not in ``graph``) keep their score unchanged. Wallets that appear
+    in ``graph`` but not in ``scores`` start at 0.0.
+
+    Implemented with bincount-based edge aggregation — O((E + N) * k)
+    time, O(E + N) memory — so the full ~14 % wash population of
+    ~1.26 M Polymarket wallets is tractable without scipy.sparse.
+    """
+    if n_iterations < 0:
+        raise ValueError("n_iterations must be >= 0")
+
+    result = dict(scores)
+    if n_iterations == 0 or graph.number_of_edges() == 0:
+        return result
+
+    nodes: list[str] = list(graph.nodes())
+    idx = {w: i for i, w in enumerate(nodes)}
+    n = len(nodes)
+
+    # Flatten undirected edges into two directed rows each so bincount
+    # aggregates both directions.
+    us: list[int] = []
+    vs: list[int] = []
+    ws: list[float] = []
+    for u, v, data in graph.edges(data=True):
+        volume = float(data.get("volume", 0.0))
+        iu, iv = idx[u], idx[v]
+        us.append(iu)
+        vs.append(iv)
+        ws.append(volume)
+        us.append(iv)
+        vs.append(iu)
+        ws.append(volume)
+
+    u_arr = np.asarray(us, dtype=np.int64)
+    v_arr = np.asarray(vs, dtype=np.int64)
+    w_arr = np.asarray(ws, dtype=np.float64)
+
+    row_sums = np.bincount(u_arr, weights=w_arr, minlength=n)
+    score_vec = np.asarray([result.get(node, 0.0) for node in nodes], dtype=np.float64)
+
+    for _ in range(n_iterations):
+        weighted = w_arr * score_vec[v_arr]
+        neighbor_sum = np.bincount(u_arr, weights=weighted, minlength=n)
+        # Isolates inside `graph` would have row_sums == 0; preserve their score.
+        denom = np.where(row_sums > 0, row_sums, 1.0)
+        updated = neighbor_sum / denom
+        score_vec = np.where(row_sums > 0, updated, score_vec)
+
+    for i, node in enumerate(nodes):
+        result[node] = float(score_vec[i])
+    return result
