@@ -5,21 +5,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import psycopg
-
 from config.settings import get_settings
+from ingestion.db import connect
 
 SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
 
 def main() -> int:
-    settings = get_settings()
-    dsn = str(settings.database_url)
-
+    dsn = str(get_settings().database_url)
     sql = SCHEMA_PATH.read_text()
     print(f"Applying {SCHEMA_PATH.name} ({len(sql):,} bytes) to {_mask(dsn)}")
 
-    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+    with connect() as conn, conn.cursor() as cur:
         cur.execute(sql)
         conn.commit()
         cur.execute(
