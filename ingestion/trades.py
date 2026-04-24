@@ -1,0 +1,296 @@
+"""Backfill Polymarket trades from on-chain ``OrderFilled`` events.
+
+Pipeline::
+
+    eth_getLogs chunks -> decode OrderFilled -> map token_id to (condition_id,
+    outcome) -> fetch block timestamps -> batched upsert into trades
+
+Resumable: each run starts at ``MAX(block_number) + 1`` in trades (or at
+the configured ``--from-block``), so interrupting with Ctrl-C is safe.
+
+CLI::
+
+    uv run python -m ingestion.trades --from-block 28000000 --chunk-size 2000
+    uv run python -m ingestion.trades --max-blocks 50000  # test run
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+import httpx
+import psycopg
+
+from ingestion.db import connect
+from ingestion.orderfilled import (
+    CTF_EXCHANGE_ADDRESS,
+    ORDER_FILLED_TOPIC0,
+    DecodedTrade,
+    decode_order_filled_log,
+)
+from ingestion.polygon_client import (
+    REQUEST_TIMEOUT_SECONDS,
+    get_block_timestamps,
+    get_latest_block,
+    get_logs,
+)
+
+# Polymarket CTFExchange was deployed around block 28_000_000 on Polygon.
+# Used as the default --from-block when resuming from scratch.
+DEFAULT_START_BLOCK = 28_000_000
+DEFAULT_CHUNK_SIZE = 2_000
+DEFAULT_DB_BATCH_SIZE = 500
+DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC = 0.05  # polite pause to stay under RPC rate limits
+
+
+@dataclass(frozen=True)
+class BackfillProgress:
+    chunks: int
+    logs_seen: int
+    trades_written: int
+    last_block: int
+
+
+UPSERT_SQL = """
+INSERT INTO trades (
+    tx_hash,
+    log_index,
+    maker_address,
+    taker_address,
+    condition_id,
+    outcome,
+    taker_side,
+    size,
+    price,
+    usdc_amount,
+    timestamp,
+    block_number
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (tx_hash, log_index) DO NOTHING;
+"""
+
+
+def load_token_index(conn: psycopg.Connection) -> dict[str, tuple[str, str]]:
+    """Load ``token_id -> (condition_id, outcome)`` from the markets table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT condition_id, yes_token_id, no_token_id FROM markets "
+            "WHERE yes_token_id IS NOT NULL OR no_token_id IS NOT NULL"
+        )
+        rows = cur.fetchall()
+
+    index: dict[str, tuple[str, str]] = {}
+    for condition_id, yes_tid, no_tid in rows:
+        if yes_tid:
+            index[yes_tid] = (condition_id, "YES")
+        if no_tid:
+            index[no_tid] = (condition_id, "NO")
+    return index
+
+
+def get_resume_block(conn: psycopg.Connection, default_start: int) -> int:
+    """Return the next block to process — MAX(block_number) + 1, or default."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT MAX(block_number) FROM trades")
+        row = cur.fetchone()
+    if row and row[0] is not None:
+        return int(row[0]) + 1
+    return default_start
+
+
+def _match_row(
+    trade: DecodedTrade,
+    token_index: dict[str, tuple[str, str]],
+    timestamp: datetime,
+) -> tuple[Any, ...] | None:
+    """Resolve a DecodedTrade to the trades-table row shape, or None to skip."""
+    resolved = token_index.get(trade.outcome_token_id)
+    if resolved is None:
+        return None  # Trade on an unknown market (not ingested yet).
+    condition_id, outcome = resolved
+    return (
+        trade.tx_hash,
+        trade.log_index,
+        trade.maker_address,
+        trade.taker_address,
+        condition_id,
+        outcome,
+        trade.taker_side,
+        trade.size,
+        trade.price,
+        trade.usdc_amount,
+        timestamp,
+        trade.block_number,
+    )
+
+
+def process_chunk(
+    from_block: int,
+    to_block: int,
+    token_index: dict[str, tuple[str, str]],
+    conn: psycopg.Connection,
+    http_client: httpx.Client,
+) -> tuple[int, int]:
+    """Fetch logs in [from_block, to_block], decode, upsert. Returns (seen, written)."""
+    logs = get_logs(
+        contract=CTF_EXCHANGE_ADDRESS,
+        topic0=ORDER_FILLED_TOPIC0,
+        from_block=from_block,
+        to_block=to_block,
+        client=http_client,
+    )
+    if not logs:
+        return (0, 0)
+
+    decoded: list[DecodedTrade] = []
+    for log in logs:
+        try:
+            trade = decode_order_filled_log(log)
+        except ValueError:
+            # Malformed event (shouldn't happen if topic0 is correct) — skip.
+            continue
+        if trade is not None:
+            decoded.append(trade)
+
+    if not decoded:
+        return (len(logs), 0)
+
+    # Fetch block timestamps for every unique block.
+    timestamps = get_block_timestamps([t.block_number for t in decoded], client=http_client)
+
+    rows: list[tuple[Any, ...]] = []
+    for trade in decoded:
+        unix_ts = timestamps.get(trade.block_number)
+        if unix_ts is None:
+            continue
+        ts = datetime.fromtimestamp(unix_ts, tz=UTC)
+        row = _match_row(trade, token_index, ts)
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        return (len(logs), 0)
+
+    with conn.cursor() as cur:
+        for offset in range(0, len(rows), DEFAULT_DB_BATCH_SIZE):
+            batch = rows[offset : offset + DEFAULT_DB_BATCH_SIZE]
+            cur.executemany(UPSERT_SQL, batch)
+    conn.commit()
+
+    return (len(logs), len(rows))
+
+
+def backfill(
+    *,
+    from_block: int | None = None,
+    to_block: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_blocks: int | None = None,
+    sleep_between_chunks: float = DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC,
+    progress_every: int = 10,
+) -> BackfillProgress:
+    """Run the backfill loop. Returns a progress summary."""
+    with connect() as conn:
+        token_index = load_token_index(conn)
+        if not token_index:
+            raise RuntimeError("No token IDs in markets — run `python -m ingestion.markets` first.")
+        resume_from = (
+            from_block if from_block is not None else get_resume_block(conn, DEFAULT_START_BLOCK)
+        )
+
+        with httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as http_client:
+            end_block = to_block if to_block is not None else get_latest_block(client=http_client)
+            if max_blocks is not None:
+                end_block = min(end_block, resume_from + max_blocks - 1)
+
+            chunks = logs_seen = trades_written = 0
+            cursor = resume_from
+
+            print(
+                f"Backfill: blocks {resume_from:,} -> {end_block:,} "
+                f"({end_block - resume_from + 1:,} blocks, "
+                f"chunk={chunk_size}, known tokens={len(token_index):,})"
+            )
+
+            while cursor <= end_block:
+                chunk_end = min(cursor + chunk_size - 1, end_block)
+                seen, written = process_chunk(cursor, chunk_end, token_index, conn, http_client)
+                logs_seen += seen
+                trades_written += written
+                chunks += 1
+
+                if chunks % progress_every == 0:
+                    pct = (chunk_end - resume_from) / max(end_block - resume_from, 1) * 100
+                    print(
+                        f"  block {chunk_end:,} [{pct:5.1f}%] "
+                        f"chunks={chunks} seen={logs_seen:,} written={trades_written:,}"
+                    )
+
+                cursor = chunk_end + 1
+                if sleep_between_chunks > 0:
+                    time.sleep(sleep_between_chunks)
+
+            last_block = cursor - 1
+
+        print(
+            f"Done. chunks={chunks} logs_seen={logs_seen:,} "
+            f"trades_written={trades_written:,} last_block={last_block:,}"
+        )
+        return BackfillProgress(chunks, logs_seen, trades_written, last_block)
+
+
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Backfill Polymarket trades from Polygon logs")
+    p.add_argument(
+        "--from-block",
+        type=int,
+        default=None,
+        help="override start block (default: resume from last ingested block)",
+    )
+    p.add_argument(
+        "--to-block",
+        type=int,
+        default=None,
+        help="override end block (default: current head)",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"blocks per eth_getLogs call (default {DEFAULT_CHUNK_SIZE})",
+    )
+    p.add_argument(
+        "--max-blocks",
+        type=int,
+        default=None,
+        help="stop after this many blocks (useful for test runs)",
+    )
+    p.add_argument(
+        "--sleep",
+        type=float,
+        default=DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC,
+        help="seconds to sleep between chunks (rate-limit politeness)",
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_argparser().parse_args(argv)
+    backfill(
+        from_block=args.from_block,
+        to_block=args.to_block,
+        chunk_size=args.chunk_size,
+        max_blocks=args.max_blocks,
+        sleep_between_chunks=args.sleep,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

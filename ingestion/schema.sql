@@ -77,6 +77,10 @@ CREATE INDEX IF NOT EXISTS idx_trades_taker ON trades(taker_address);
 CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(condition_id);
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp DESC);
 
+-- Block number retained for resumable backfill (MAX(block_number) is the cursor).
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS block_number BIGINT;
+CREATE INDEX IF NOT EXISTS idx_trades_block ON trades(block_number);
+
 -- =========================================================================
 -- Positions
 -- =========================================================================

@@ -5,6 +5,68 @@ that shape the codebase. Most recent entry on top.
 
 ---
 
+## 2026-04-24 (late) — Trades ingestion routed through on-chain logs
+
+**Discovery:** the Polymarket `data-api.polymarket.com/trades` endpoint
+returns **one-sided** records — each row is a single participant's view
+of a match, with 100% unique `transactionHash` values across a 100-trade
+sample. The counterparty is not exposed there.
+
+For wash detection we need the full `(maker, taker)` pair, so the
+project now reads `OrderFilled` events directly from the CTFExchange
+contract on Polygon.
+
+**Fixed on-chain facts:**
+
+- Contract: `0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e`
+- Event topic0: `0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6`
+- ABI:
+
+  ```
+  OrderFilled(
+      bytes32 indexed orderHash,
+      address indexed maker,
+      address indexed taker,
+      uint256 makerAssetId,
+      uint256 takerAssetId,
+      uint256 makerAmountFilled,
+      uint256 takerAmountFilled,
+      uint256 fee
+  )
+  ```
+
+- Asset id `0` = USDC; non-zero uint256 = outcome ERC-1155 token id.
+- Taker side is derived from which side carries the zero:
+  - `takerAssetId == 0` → taker paid USDC → `BUY`
+  - `makerAssetId == 0` → taker received USDC → `SELL`
+- USDC and Polymarket outcome tokens both have 6 decimals, so
+  `size = outcome_amount / 1e6` and `usdc = usdc_amount / 1e6`.
+
+**Events to drop:**
+
+- Self-trades where maker == taker (rare, but present).
+- Events where one side is the exchange contract itself (internal
+  neg-risk bookkeeping).
+- Token-for-token swaps (neither side is cash) — not trades in our model.
+
+**Ingestion design:**
+
+- `ingestion/polygon_client.py` — thin RPC wrapper (eth_blockNumber,
+  eth_getLogs, batched eth_getBlockByNumber for timestamps).
+- `ingestion/orderfilled.py` — pure decoder from raw log to DecodedTrade.
+- `ingestion/trades.py` — orchestrator: resume from
+  `MAX(block_number) + 1`, iterate in chunks (default 2k blocks), look
+  up `outcome_token_id` against markets, bulk upsert with
+  `ON CONFLICT DO NOTHING`.
+
+Schema added `trades.block_number BIGINT` (indexed) as the resume cursor
+and `markets.{yes,no}_token_id TEXT` (indexed) to map event asset IDs
+back to `(condition_id, outcome)`.
+
+**Status:** code + 21 targeted tests green, ready for first live backfill.
+
+---
+
 ## 2026-04-24 — Gamma API shape verified, ingestion unpaused
 
 **Owner ran the probe command from a reachable network** and returned a
