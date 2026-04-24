@@ -89,14 +89,22 @@ def test_get_block_timestamps_batches_and_flattens() -> None:
         body = json.loads(req.content)
         captured.append(body)
         # Echo back one result per request.
-        payload = [
-            {
+        if isinstance(body, list):
+            payload: Any = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": entry["id"],
+                    "result": {"timestamp": hex(entry["id"] * 2)},
+                }
+                for entry in body
+            ]
+        else:
+            bn = int(body["params"][0], 16)
+            payload = {
                 "jsonrpc": "2.0",
-                "id": entry["id"],
-                "result": {"timestamp": hex(entry["id"] * 2)},
+                "id": body["id"],
+                "result": {"timestamp": hex(bn * 2)},
             }
-            for entry in body
-        ]
         return httpx.Response(200, json=payload)
 
     with _mock_client(handler) as c:
@@ -104,7 +112,36 @@ def test_get_block_timestamps_batches_and_flattens() -> None:
     assert out == {100: 200, 200: 400, 300: 600}
     # Dedup should leave 3 entries in the single batch.
     assert len(captured) == 1
-    assert {entry["id"] for entry in captured[0]} == {100, 200, 300}
+    batch = captured[0]
+    assert isinstance(batch, list)
+    assert {entry["id"] for entry in batch} == {100, 200, 300}
+
+
+def test_get_block_timestamps_halves_batch_on_server_error() -> None:
+    """Some providers 500 on large batches — code should split and retry."""
+    import json
+
+    # Reject any batch of >= 2; accept single requests.
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        if isinstance(body, list) and len(body) >= 2:
+            return httpx.Response(500, text="batch too large")
+        if isinstance(body, list):  # batch of 1
+            entry = body[0]
+            bn = int(entry["params"][0], 16)
+            return httpx.Response(
+                200,
+                json=[{"jsonrpc": "2.0", "id": entry["id"], "result": {"timestamp": hex(bn * 3)}}],
+            )
+        bn = int(body["params"][0], 16)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": body["id"], "result": {"timestamp": hex(bn * 3)}},
+        )
+
+    with _mock_client(handler) as c:
+        out = get_block_timestamps([10, 20, 30], client=c, url=URL)
+    assert out == {10: 30, 20: 60, 30: 90}
 
 
 def test_get_block_timestamps_empty_input_short_circuits() -> None:

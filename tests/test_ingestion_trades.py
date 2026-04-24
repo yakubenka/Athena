@@ -103,6 +103,17 @@ def _build_rpc_mock(logs: list[dict[str, Any]], block_timestamps: dict[int, int]
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": logs})
         if body["method"] == "eth_blockNumber":
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x5000000"})
+        if body["method"] == "eth_getBlockByNumber":
+            bn = int(body["params"][0], 16)
+            ts = block_timestamps.get(bn)
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {"timestamp": hex(ts)} if ts is not None else None,
+                },
+            )
         return httpx.Response(
             200, json={"jsonrpc": "2.0", "id": 1, "error": f"unhandled {body['method']}"}
         )
