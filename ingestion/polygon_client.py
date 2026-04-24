@@ -10,6 +10,7 @@ Everything else is handled by :mod:`ingestion.trades`.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -18,6 +19,13 @@ from config.settings import get_settings
 
 REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_BATCH_SIZE = 1000  # JSON-RPC batch cap tolerated by Alchemy and most nodes
+
+# Transient server/rate-limit errors we retry with exponential backoff.
+# Size-related 400s are handled separately by the adaptive-split code in
+# ingestion.trades because they need a smaller range, not a retry.
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+DEFAULT_RETRIES = 5
+RETRY_BASE_DELAY_SEC = 1.0  # doubles each attempt: 1s, 2s, 4s, 8s, 16s
 
 
 def _resolve_url(url: str | None, client: httpx.Client | None) -> str:
@@ -39,22 +47,48 @@ def rpc_call(
     *,
     client: httpx.Client | None = None,
     url: str | None = None,
+    max_retries: int = DEFAULT_RETRIES,
+    retry_base_delay: float = RETRY_BASE_DELAY_SEC,
+    sleep: Any = time.sleep,
 ) -> Any:
-    """Single JSON-RPC call. Returns the ``result`` field, raises on error."""
+    """Single JSON-RPC call with retry on transient errors.
+
+    Retries HTTP 429/500/502/503/504 and network errors with exponential
+    backoff (base * 2**attempt). Size-related 400s are left for the
+    caller to handle via range splitting — retrying those is pointless.
+    """
     body = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
     target = _resolve_url(url, client)
     owns = client is None
     active = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
-        resp = active.post(target, json=body)
-        if resp.status_code >= 400:
-            # Surface the body so quirks like Alchemy's "exceeded 10k results"
-            # show up in logs instead of a bare HTTPStatusError.
-            raise RuntimeError(f"RPC HTTP {resp.status_code} on {method}: {resp.text[:500]}")
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(f"RPC error on {method}: {data['error']}")
-        return data["result"]
+        for attempt in range(max_retries + 1):
+            try:
+                resp = active.post(target, json=body)
+            except httpx.TransportError as exc:
+                # Network hiccup (connection reset, timeout, DNS blip).
+                if attempt >= max_retries:
+                    raise RuntimeError(f"RPC transport error on {method}: {exc}") from exc
+                sleep(retry_base_delay * (2**attempt))
+                continue
+
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+                sleep(retry_base_delay * (2**attempt))
+                continue
+
+            if resp.status_code >= 400:
+                # Surface body so Alchemy/drpc-specific quirks show up in logs.
+                raise RuntimeError(f"RPC HTTP {resp.status_code} on {method}: {resp.text[:500]}")
+            data = resp.json()
+            if "error" in data:
+                raise RuntimeError(f"RPC error on {method}: {data['error']}")
+            return data["result"]
+
+        # Exhausted retries after only retryable statuses.
+        raise RuntimeError(
+            f"RPC HTTP {resp.status_code} on {method} after {max_retries} retries: "
+            f"{resp.text[:500]}"
+        )
     finally:
         if owns:
             active.close()
@@ -177,11 +211,28 @@ def _fetch_one_batch(
             for bn in chunk
         ]
 
-    resp = client.post(target, json=body)
+    # Retry transient errors a few times before giving up.
+    resp = None
+    last_exc: Exception | None = None
+    for attempt in range(DEFAULT_RETRIES + 1):
+        try:
+            resp = client.post(target, json=body)
+        except httpx.TransportError as exc:
+            last_exc = exc
+            if attempt >= DEFAULT_RETRIES:
+                raise RuntimeError(f"eth_getBlockByNumber transport error: {exc}") from exc
+            time.sleep(RETRY_BASE_DELAY_SEC * (2**attempt))
+            continue
+        if resp.status_code in RETRYABLE_STATUS_CODES and attempt < DEFAULT_RETRIES:
+            time.sleep(RETRY_BASE_DELAY_SEC * (2**attempt))
+            continue
+        break
+    if resp is None:
+        raise RuntimeError(f"eth_getBlockByNumber failed without response: {last_exc}")
     if resp.status_code >= 400:
         # Surface body for visibility; tag retryable 4xx/5xx as batch errors.
         snippet = resp.text[:300]
-        if resp.status_code in (400, 413, 429, 500, 502, 503, 504) and len(chunk) > 1:
+        if resp.status_code in (400, 413, *RETRYABLE_STATUS_CODES) and len(chunk) > 1:
             raise _BatchRejectedError(f"HTTP {resp.status_code} on batch: {snippet}")
         raise RuntimeError(f"eth_getBlockByNumber HTTP {resp.status_code}: {snippet}")
 

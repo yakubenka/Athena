@@ -80,6 +80,66 @@ def test_get_logs_rejects_bad_range() -> None:
         get_logs(contract="0x0", topic0="0x0", from_block=10, to_block=5, url=URL)
 
 
+def test_rpc_call_retries_on_transient_status_then_succeeds() -> None:
+    # First two calls 502, third succeeds. Should return the result.
+    responses = iter([502, 502, 200])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        status = next(responses)
+        if status == 200:
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x7"})
+        return httpx.Response(status, text="bad gateway")
+
+    with _mock_client(handler) as c:
+        # max_retries=2 is exactly enough for 2 retries + 1 original attempt.
+        out = rpc_call(
+            "eth_blockNumber",
+            [],
+            client=c,
+            url=URL,
+            max_retries=2,
+            retry_base_delay=0.0,  # no actual waiting in tests
+            sleep=lambda _s: None,
+        )
+    assert out == "0x7"
+
+
+def test_rpc_call_raises_after_max_retries_on_persistent_5xx() -> None:
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="still down")
+
+    with _mock_client(handler) as c, pytest.raises(RuntimeError, match="503"):
+        rpc_call(
+            "eth_blockNumber",
+            [],
+            client=c,
+            url=URL,
+            max_retries=2,
+            retry_base_delay=0.0,
+            sleep=lambda _s: None,
+        )
+
+
+def test_rpc_call_does_not_retry_non_retryable_4xx() -> None:
+    attempts = [0]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        attempts[0] += 1
+        return httpx.Response(401, text="unauthorized")
+
+    with _mock_client(handler) as c, pytest.raises(RuntimeError, match="401"):
+        rpc_call(
+            "eth_blockNumber",
+            [],
+            client=c,
+            url=URL,
+            max_retries=3,
+            retry_base_delay=0.0,
+            sleep=lambda _s: None,
+        )
+    assert attempts[0] == 1  # first attempt was final
+
+
 def test_get_block_timestamps_batches_and_flattens() -> None:
     captured: list[Any] = []
 
