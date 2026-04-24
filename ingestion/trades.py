@@ -187,6 +187,10 @@ def _fetch_logs_with_adaptive_split(
                 "payload size",
                 "range is too large",
                 "http 400",
+                # Truncated/corrupted JSON usually means the response was too
+                # big for the provider to serialize in one go — halve and retry.
+                "json decode error",
+                "unterminated string",
             )
         )
         if not too_many or from_block >= to_block:

@@ -10,6 +10,7 @@ Everything else is handled by :mod:`ingestion.trades`.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -79,7 +80,17 @@ def rpc_call(
             if resp.status_code >= 400:
                 # Surface body so Alchemy/drpc-specific quirks show up in logs.
                 raise RuntimeError(f"RPC HTTP {resp.status_code} on {method}: {resp.text[:500]}")
-            data = resp.json()
+            try:
+                data = resp.json()
+            except json.JSONDecodeError as exc:
+                # Truncated / corrupted payload (e.g. drpc cutting a huge
+                # response mid-stream). Treat as transient and retry.
+                if attempt < max_retries:
+                    sleep(retry_base_delay * (2**attempt))
+                    continue
+                raise RuntimeError(
+                    f"RPC JSON decode error on {method} after {max_retries} retries: {exc}"
+                ) from exc
             if "error" in data:
                 raise RuntimeError(f"RPC error on {method}: {data['error']}")
             return data["result"]
