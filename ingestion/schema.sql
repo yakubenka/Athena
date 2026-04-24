@@ -46,6 +46,14 @@ CREATE TABLE IF NOT EXISTS markets (
     total_volume NUMERIC(20, 6)
 );
 
+-- Polymarket CLOB token IDs for mapping on-chain asset IDs -> (market, outcome).
+-- These are uint256 values from the CTF framework; store as TEXT so we don't
+-- lose precision. Added after the initial backfill, so IF NOT EXISTS.
+ALTER TABLE markets ADD COLUMN IF NOT EXISTS yes_token_id TEXT;
+ALTER TABLE markets ADD COLUMN IF NOT EXISTS no_token_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_markets_yes_token ON markets(yes_token_id);
+CREATE INDEX IF NOT EXISTS idx_markets_no_token ON markets(no_token_id);
+
 -- =========================================================================
 -- Trades
 -- =========================================================================

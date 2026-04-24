@@ -74,6 +74,25 @@ class GammaMarket(BaseModel):
     # We keep the flag so the ingestion layer can filter if desired.
     neg_risk: bool = Field(default=False, alias="negRisk")
 
+    # CLOB ERC-1155 token IDs (one per outcome, position-aligned with
+    # ``outcomes``). Needed to map on-chain trade asset IDs back to our
+    # (condition_id, outcome) pair.
+    clob_token_ids: list[str] = Field(default_factory=list, alias="clobTokenIds")
+
+    @property
+    def yes_token_id(self) -> str | None:
+        return self._token_id_for("Yes")
+
+    @property
+    def no_token_id(self) -> str | None:
+        return self._token_id_for("No")
+
+    def _token_id_for(self, outcome_label: str) -> str | None:
+        for label, token_id in zip(self.outcomes, self.clob_token_ids, strict=False):
+            if label.strip().lower() == outcome_label.strip().lower():
+                return token_id
+        return None
+
     @field_validator("outcomes", mode="before")
     @classmethod
     def _parse_outcomes(cls, value: Any) -> Any:
@@ -85,6 +104,14 @@ class GammaMarket(BaseModel):
         parsed = _maybe_parse_json_list(value)
         if isinstance(parsed, list):
             return [float(x) for x in parsed]
+        return parsed
+
+    @field_validator("clob_token_ids", mode="before")
+    @classmethod
+    def _parse_clob_token_ids(cls, value: Any) -> Any:
+        parsed = _maybe_parse_json_list(value)
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
         return parsed
 
 

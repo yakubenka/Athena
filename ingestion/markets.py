@@ -34,16 +34,20 @@ INSERT INTO markets (
     end_date,
     resolved_at,
     resolved_outcome,
-    total_volume
+    total_volume,
+    yes_token_id,
+    no_token_id
 )
-VALUES (%s, %s, %s, %s, %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (condition_id) DO UPDATE SET
     question = EXCLUDED.question,
     created_at = COALESCE(EXCLUDED.created_at, markets.created_at),
     end_date = COALESCE(EXCLUDED.end_date, markets.end_date),
     resolved_at = COALESCE(EXCLUDED.resolved_at, markets.resolved_at),
     resolved_outcome = COALESCE(EXCLUDED.resolved_outcome, markets.resolved_outcome),
-    total_volume = COALESCE(EXCLUDED.total_volume, markets.total_volume);
+    total_volume = COALESCE(EXCLUDED.total_volume, markets.total_volume),
+    yes_token_id = COALESCE(EXCLUDED.yes_token_id, markets.yes_token_id),
+    no_token_id = COALESCE(EXCLUDED.no_token_id, markets.no_token_id);
 """
 
 
@@ -57,6 +61,8 @@ def market_to_row(market: GammaMarket) -> tuple[Any, ...]:
         market.resolved_at,
         market.resolved_outcome,
         market.volume_num,
+        market.yes_token_id,
+        market.no_token_id,
     )
 
 

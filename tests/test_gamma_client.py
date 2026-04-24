@@ -102,6 +102,23 @@ def test_outcomes_fall_back_when_not_json() -> None:
     assert market.outcomes == ["Yes", "No"]
 
 
+def test_clob_token_ids_parsed_and_mapped_to_outcomes() -> None:
+    market = GammaMarket.model_validate(_sample_market())
+    assert market.clob_token_ids == ["123", "456"]
+    # outcomes is '["Yes", "No"]' => yes maps to first token, no to second.
+    assert market.yes_token_id == "123"
+    assert market.no_token_id == "456"
+
+
+def test_clob_token_ids_missing_gives_none() -> None:
+    payload = _sample_market()
+    payload.pop("clobTokenIds")
+    market = GammaMarket.model_validate(payload)
+    assert market.clob_token_ids == []
+    assert market.yes_token_id is None
+    assert market.no_token_id is None
+
+
 def test_invalid_limit_rejected() -> None:
     with pytest.raises(ValueError):
         fetch_markets_page(offset=0, limit=0, base_url=BASE_URL)

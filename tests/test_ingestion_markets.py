@@ -32,6 +32,8 @@ def _market(
     closed: bool = False,
     resolved_outcome: str | None = None,
     resolved_at: datetime | None = None,
+    yes_token: str = "1001",
+    no_token: str = "1002",
 ) -> GammaMarket:
     return GammaMarket.model_validate(
         {
@@ -45,6 +47,7 @@ def _market(
             "volumeNum": volume,
             "outcomes": '["Yes", "No"]',
             "outcomePrices": '["0.5", "0.5"]',
+            "clobTokenIds": f'["{yes_token}", "{no_token}"]',
             "resolvedAt": resolved_at.isoformat() if resolved_at else None,
             "resolvedOutcome": resolved_outcome,
         }
@@ -61,11 +64,25 @@ def clean_markets() -> None:
 
 
 def test_market_to_row_matches_column_order() -> None:
-    m = _market("0xrow", volume=42.0)
+    m = _market("0xrow", volume=42.0, yes_token="777", no_token="888")
     row = market_to_row(m)
     assert row[0] == "0xrow"
     assert row[1] == "Will X happen?"
     assert row[6] == 42.0
+    assert row[7] == "777"
+    assert row[8] == "888"
+
+
+def test_upsert_persists_token_ids(clean_markets: None) -> None:
+    upsert_markets([_market("0xtok", yes_token="111", no_token="222")])
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT yes_token_id, no_token_id FROM markets WHERE condition_id = %s",
+            ("0xtok",),
+        )
+        row = cur.fetchone()
+    assert row == ("111", "222")
 
 
 def test_chunked_yields_full_and_final_partial_batches() -> None:
