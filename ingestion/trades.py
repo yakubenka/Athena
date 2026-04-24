@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -35,9 +36,9 @@ from ingestion.orderfilled import (
 )
 from ingestion.polygon_client import (
     REQUEST_TIMEOUT_SECONDS,
-    get_block_timestamps,
     get_latest_block,
     get_logs,
+    rpc_call,
 )
 
 # Polymarket CTFExchange was deployed around block 28_000_000 on Polygon.
@@ -46,6 +47,30 @@ DEFAULT_START_BLOCK = 28_000_000
 DEFAULT_CHUNK_SIZE = 2_000
 DEFAULT_DB_BATCH_SIZE = 500
 DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC = 0.05  # polite pause to stay under RPC rate limits
+
+# Polygon averages ~2.1 seconds per block historically. Using this to
+# approximate block timestamps lets us skip per-block eth_getBlockByNumber
+# calls entirely — critical for free-tier RPC providers that rate-limit
+# hundreds of calls per second. Accuracy is within minutes over multi-year
+# spans; plenty for monthly PnL buckets and wash-cycle detection.
+POLYGON_AVG_BLOCK_TIME_SEC = 2.1
+
+
+def make_block_timestamp_estimator(
+    http_client: httpx.Client,
+    avg_block_time_sec: float = POLYGON_AVG_BLOCK_TIME_SEC,
+) -> Callable[[int], datetime]:
+    """One RPC call to calibrate, then pure arithmetic for every subsequent block."""
+    head = rpc_call("eth_getBlockByNumber", ["latest", False], client=http_client)
+    head_number = int(head["number"], 16)
+    head_ts = int(head["timestamp"], 16)
+
+    def estimate(block_number: int) -> datetime:
+        delta_blocks = head_number - block_number
+        unix_ts = head_ts - round(delta_blocks * avg_block_time_sec)
+        return datetime.fromtimestamp(unix_ts, tz=UTC)
+
+    return estimate
 
 
 @dataclass(frozen=True)
@@ -178,8 +203,12 @@ def process_chunk(
     token_index: dict[str, tuple[str, str]],
     conn: psycopg.Connection,
     http_client: httpx.Client,
+    timestamp_fn: Callable[[int], datetime],
 ) -> tuple[int, int]:
-    """Fetch logs in [from_block, to_block], decode, upsert. Returns (seen, written)."""
+    """Fetch logs in [from_block, to_block], decode, upsert. Returns (seen, written).
+
+    ``timestamp_fn`` maps a block number to its (approximate) wall-clock time.
+    """
     logs = _fetch_logs_with_adaptive_split(from_block, to_block, http_client)
     if not logs:
         return (0, 0)
@@ -197,15 +226,9 @@ def process_chunk(
     if not decoded:
         return (len(logs), 0)
 
-    # Fetch block timestamps for every unique block.
-    timestamps = get_block_timestamps([t.block_number for t in decoded], client=http_client)
-
     rows: list[tuple[Any, ...]] = []
     for trade in decoded:
-        unix_ts = timestamps.get(trade.block_number)
-        if unix_ts is None:
-            continue
-        ts = datetime.fromtimestamp(unix_ts, tz=UTC)
+        ts = timestamp_fn(trade.block_number)
         row = _match_row(trade, token_index, ts)
         if row is not None:
             rows.append(row)
@@ -245,18 +268,23 @@ def backfill(
             if max_blocks is not None:
                 end_block = min(end_block, resume_from + max_blocks - 1)
 
+            timestamp_fn = make_block_timestamp_estimator(http_client)
+
             chunks = logs_seen = trades_written = 0
             cursor = resume_from
 
             print(
                 f"Backfill: blocks {resume_from:,} -> {end_block:,} "
                 f"({end_block - resume_from + 1:,} blocks, "
-                f"chunk={chunk_size}, known tokens={len(token_index):,})"
+                f"chunk={chunk_size}, known tokens={len(token_index):,}, "
+                f"ts-mode=approximate)"
             )
 
             while cursor <= end_block:
                 chunk_end = min(cursor + chunk_size - 1, end_block)
-                seen, written = process_chunk(cursor, chunk_end, token_index, conn, http_client)
+                seen, written = process_chunk(
+                    cursor, chunk_end, token_index, conn, http_client, timestamp_fn
+                )
                 logs_seen += seen
                 trades_written += written
                 chunks += 1

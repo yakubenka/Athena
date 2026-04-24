@@ -7,6 +7,7 @@ the live local Postgres. Skips cleanly if the DB isn't reachable.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -20,8 +21,21 @@ from ingestion.trades import (
     DEFAULT_START_BLOCK,
     get_resume_block,
     load_token_index,
+    make_block_timestamp_estimator,
     process_chunk,
 )
+
+
+def _fixed_ts_fn(mapping: dict[int, int]) -> Any:
+    """Deterministic block->datetime fn backed by a unix-timestamp dict."""
+
+    def estimate(block_number: int) -> datetime:
+        unix_ts = mapping.get(block_number)
+        if unix_ts is None:
+            raise KeyError(f"no timestamp seeded for block {block_number}")
+        return datetime.fromtimestamp(unix_ts, tz=UTC)
+
+    return estimate
 
 
 def _db_reachable() -> bool:
@@ -150,6 +164,35 @@ def seeded_market() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_block_timestamp_estimator_is_linear_in_block_number() -> None:
+    """One calibration call; then every subsequent block uses linear arithmetic."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["method"] == "eth_getBlockByNumber"
+        assert body["params"] == ["latest", False]
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"number": hex(100_000_000), "timestamp": hex(1_800_000_000)},
+            },
+        )
+
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="https://polygon.test"
+    ) as client:
+        estimate = make_block_timestamp_estimator(client, avg_block_time_sec=2.0)
+
+    head_ts = estimate(100_000_000).timestamp()
+    assert head_ts == 1_800_000_000
+
+    # Each block earlier is 2s earlier.
+    earlier = estimate(99_999_000).timestamp()
+    assert earlier == 1_800_000_000 - 1_000 * 2
+
+
 def test_load_token_index_reads_both_outcomes(seeded_market: None) -> None:
     with connect() as conn:
         index = load_token_index(conn)
@@ -192,7 +235,9 @@ def test_process_chunk_decodes_and_writes_trades(seeded_market: None) -> None:
 
     with connect() as conn, _build_rpc_mock(logs, timestamps) as client:
         index = load_token_index(conn)
-        seen, written = process_chunk(1_000_000, 1_000_010, index, conn, client)
+        seen, written = process_chunk(
+            1_000_000, 1_000_010, index, conn, client, _fixed_ts_fn(timestamps)
+        )
 
     assert seen == 2
     assert written == 2
@@ -233,9 +278,10 @@ def test_process_chunk_is_idempotent(seeded_market: None) -> None:
 
     with connect() as conn, _build_rpc_mock([log], timestamps) as client:
         index = load_token_index(conn)
-        process_chunk(2_000_000, 2_000_000, index, conn, client)
+        ts_fn = _fixed_ts_fn(timestamps)
+        process_chunk(2_000_000, 2_000_000, index, conn, client, ts_fn)
         # Second run should not insert duplicates thanks to ON CONFLICT DO NOTHING.
-        process_chunk(2_000_000, 2_000_000, index, conn, client)
+        process_chunk(2_000_000, 2_000_000, index, conn, client, ts_fn)
 
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM trades")
@@ -259,7 +305,9 @@ def test_process_chunk_skips_unknown_token(seeded_market: None) -> None:
     )
     with connect() as conn, _build_rpc_mock([log], {3_000_000: 1}) as client:
         index = load_token_index(conn)
-        seen, written = process_chunk(3_000_000, 3_000_000, index, conn, client)
+        seen, written = process_chunk(
+            3_000_000, 3_000_000, index, conn, client, _fixed_ts_fn({3_000_000: 1})
+        )
 
     assert seen == 1
     assert written == 0
@@ -326,7 +374,9 @@ def test_adaptive_split_on_too_many_results(seeded_market: None) -> None:
 
     with connect() as conn, client:
         index = load_token_index(conn)
-        seen, written = process_chunk(5_000_000, 5_000_999, index, conn, client)
+        seen, written = process_chunk(
+            5_000_000, 5_000_999, index, conn, client, _fixed_ts_fn(timestamps)
+        )
 
     assert seen == 2
     assert written == 2
@@ -349,7 +399,7 @@ def test_resume_block_advances_after_write(seeded_market: None) -> None:
     )
     with connect() as conn, _build_rpc_mock([log], {4_000_000: 1}) as client:
         index = load_token_index(conn)
-        process_chunk(4_000_000, 4_000_000, index, conn, client)
+        process_chunk(4_000_000, 4_000_000, index, conn, client, _fixed_ts_fn({4_000_000: 1}))
 
     with connect() as conn:
         assert get_resume_block(conn, DEFAULT_START_BLOCK) == 4_000_001
