@@ -254,6 +254,76 @@ def test_process_chunk_skips_unknown_token(seeded_market: None) -> None:
     assert written == 0
 
 
+def test_adaptive_split_on_too_many_results(seeded_market: None) -> None:
+    """Simulate Alchemy rejecting a big range with a size error — we should
+    auto-split and still ingest everything."""
+    log_early = _make_log(
+        maker=MAKER,
+        taker=TAKER,
+        maker_asset_id=0,
+        taker_asset_id=int(YES_TOKEN),
+        maker_amount=1_000_000,
+        taker_amount=2_000_000,
+        tx_hash="0x" + "1a" * 32,
+        log_index=0,
+        block_number=5_000_100,
+    )
+    log_late = _make_log(
+        maker=MAKER,
+        taker=TAKER,
+        maker_asset_id=0,
+        taker_asset_id=int(YES_TOKEN),
+        maker_amount=3_000_000,
+        taker_amount=4_000_000,
+        tx_hash="0x" + "1b" * 32,
+        log_index=0,
+        block_number=5_000_800,
+    )
+    timestamps = {5_000_100: 1_700_100_000, 5_000_800: 1_700_100_500}
+
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            out = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": e["id"],
+                    "result": {"timestamp": hex(timestamps.get(int(e["id"]), 0))},
+                }
+                for e in body
+            ]
+            return httpx.Response(200, json=out)
+        if body["method"] != "eth_getLogs":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": "0x0"})
+        call_count["n"] += 1
+        params = body["params"][0]
+        fb = int(params["fromBlock"], 16)
+        tb = int(params["toBlock"], 16)
+        # Reject any range wider than 500 blocks as "too many results".
+        if tb - fb >= 500:
+            return httpx.Response(
+                400,
+                text="query returned more than 10000 results; try a smaller block range",
+            )
+        logs = [log_early, log_late]
+        matches = [log for log in logs if fb <= int(log["blockNumber"], 16) <= tb]
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": matches})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url="https://polygon.test")
+
+    with connect() as conn, client:
+        index = load_token_index(conn)
+        seen, written = process_chunk(5_000_000, 5_000_999, index, conn, client)
+
+    assert seen == 2
+    assert written == 2
+    # Initial call rejected, split into [5_000_000..5_000_499] and
+    # [5_000_500..5_000_999]; those may split further. Count should be >= 3.
+    assert call_count["n"] >= 3
+
+
 def test_resume_block_advances_after_write(seeded_market: None) -> None:
     log = _make_log(
         maker=MAKER,

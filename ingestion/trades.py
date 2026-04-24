@@ -130,6 +130,48 @@ def _match_row(
     )
 
 
+def _fetch_logs_with_adaptive_split(
+    from_block: int,
+    to_block: int,
+    http_client: httpx.Client,
+) -> list[dict[str, Any]]:
+    """Call get_logs, halving the range if the RPC rejects it as too large.
+
+    Alchemy and most providers cap getLogs at ~10k results per call; during
+    busy Polymarket periods a 2k-block window can exceed that. When the RPC
+    returns an error that looks size-related, we recurse on the two halves.
+    """
+    try:
+        return get_logs(
+            contract=CTF_EXCHANGE_ADDRESS,
+            topic0=ORDER_FILLED_TOPIC0,
+            from_block=from_block,
+            to_block=to_block,
+            client=http_client,
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        too_many = any(
+            marker in message
+            for marker in (
+                "10000",
+                "10,000",
+                "too many",
+                "query returned more",
+                "response size",
+                "payload size",
+                "range is too large",
+                "http 400",
+            )
+        )
+        if not too_many or from_block >= to_block:
+            raise
+        mid = (from_block + to_block) // 2
+        left = _fetch_logs_with_adaptive_split(from_block, mid, http_client)
+        right = _fetch_logs_with_adaptive_split(mid + 1, to_block, http_client)
+        return left + right
+
+
 def process_chunk(
     from_block: int,
     to_block: int,
@@ -138,13 +180,7 @@ def process_chunk(
     http_client: httpx.Client,
 ) -> tuple[int, int]:
     """Fetch logs in [from_block, to_block], decode, upsert. Returns (seen, written)."""
-    logs = get_logs(
-        contract=CTF_EXCHANGE_ADDRESS,
-        topic0=ORDER_FILLED_TOPIC0,
-        from_block=from_block,
-        to_block=to_block,
-        client=http_client,
-    )
+    logs = _fetch_logs_with_adaptive_split(from_block, to_block, http_client)
     if not logs:
         return (0, 0)
 

@@ -47,10 +47,13 @@ def rpc_call(
     active = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
         resp = active.post(target, json=body)
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            # Surface the body so quirks like Alchemy's "exceeded 10k results"
+            # show up in logs instead of a bare HTTPStatusError.
+            raise RuntimeError(f"RPC HTTP {resp.status_code} on {method}: {resp.text[:500]}")
         data = resp.json()
         if "error" in data:
-            raise RuntimeError(f"RPC error: {data['error']}")
+            raise RuntimeError(f"RPC error on {method}: {data['error']}")
         return data["result"]
     finally:
         if owns:
