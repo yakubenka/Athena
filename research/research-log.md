@@ -5,6 +5,54 @@ that shape the codebase. Most recent entry on top.
 
 ---
 
+## 2026-04-24 — Gamma API shape verified, ingestion unpaused
+
+**Owner ran the probe command from a reachable network** and returned a
+full JSON sample for one market. The client is now written and tested
+against that exact shape (see `ingestion/gamma_client.py`).
+
+**Confirmed Gamma /markets fields we persist:**
+
+| Gamma field     | Type           | Our `markets` column | Notes                         |
+|-----------------|----------------|----------------------|-------------------------------|
+| `conditionId`   | str (0x…66)    | `condition_id` (PK)  | direct 1:1                    |
+| `question`      | str            | `question`           | direct                        |
+| `createdAt`     | ISO datetime   | `created_at`         | timezone-aware                |
+| `endDate`       | ISO datetime   | `end_date`           | timezone-aware                |
+| `resolvedAt`    | ISO datetime?  | `resolved_at`        | present only on closed markets|
+| `resolvedOutcome` | str?         | `resolved_outcome`   | present only on closed markets|
+| `volumeNum`     | float          | `total_volume`       | numeric sibling of `volume` string |
+
+**Parsed but not persisted yet:** `slug`, `description`, `active`,
+`closed`, `archived`, `outcomes` (JSON-string `'["Yes","No"]'`),
+`outcomePrices` (JSON-string of numeric strings), `liquidityNum`,
+`negRisk`.
+
+**Gaps / deferred:**
+
+- **No `category` field on the market itself.** Category lives at the
+  *event* level (`events[0]`) or via a `/tags` endpoint we haven't
+  probed. `markets.category` stays NULL at first backfill. Derive later
+  by either (a) joining to `events` endpoint, or (b) keyword matching
+  on question text.
+- `events[0]` carries a rich nested object (title, slug, image, volume,
+  liquidity, context description) that can substitute for category in
+  the meantime. Not ingested yet to keep the first backfill simple.
+- Multi-option `negRisk` markets use a separate `questionID`; for v1 we
+  treat both flavors the same and key on `conditionId`.
+
+**What's in place:**
+
+- `ingestion.gamma_client` — typed Pydantic model, pagination iterator.
+- `ingestion.markets` — batched upsert with `ON CONFLICT DO UPDATE`
+  that preserves existing resolution data when a later poll omits it.
+- CLI: `uv run python -m ingestion.markets --limit N [--closed true|false|all] [--dry-run]`.
+
+Next blocker: trades ingestion (on-chain via Polygon RPC or the CLOB
+API). Markets-only backfill is unblocked and can run now.
+
+---
+
 ## 2026-04-23 — Gamma API ingestion paused
 
 **Decision:** pause P2.4–P2.7 (Gamma API client + markets ingestion)
