@@ -21,6 +21,8 @@ import pandas as pd
 from ingestion.db import connect
 from wash_detector.sirolly import run_wash_detection
 
+ANALYZE_TOP_DEFAULT = 5
+
 
 def load_trades(limit: int | None) -> pd.DataFrame:
     """Read trades into the column shape Sirolly expects."""
@@ -51,6 +53,45 @@ def load_trades(limit: int | None) -> pd.DataFrame:
     return df
 
 
+def analyze_clusters(clusters: list[frozenset[str]], top_n: int) -> None:
+    """For the top-N clusters, query the DB for behaviour stats.
+
+    For each cluster prints: # wallets, # unique markets traded,
+    total volume in USD, # internal trades (both sides in cluster) and
+    the share of all cluster-touching trades that are internal. A high
+    internal-trade share is the strongest behavioural signal of wash:
+    organic trading touches ten thousand counterparties; a wash farm
+    keeps the volume in the family.
+    """
+    if not clusters:
+        return
+    print(f"\nAnalyzing top {min(top_n, len(clusters))} clusters...")
+    sql = """
+        SELECT
+            COUNT(*) AS total_trades,
+            COUNT(DISTINCT condition_id) AS markets,
+            SUM(CASE WHEN maker_address = ANY(%s) AND taker_address = ANY(%s)
+                     THEN 1 ELSE 0 END) AS internal_trades,
+            COALESCE(SUM(usdc_amount), 0) AS volume_usd
+        FROM trades
+        WHERE maker_address = ANY(%s) OR taker_address = ANY(%s)
+    """
+    ranked = sorted(clusters, key=len, reverse=True)[:top_n]
+    with connect() as conn, conn.cursor() as cur:
+        for i, cluster in enumerate(ranked, start=1):
+            wallets = list(cluster)
+            cur.execute(sql, (wallets, wallets, wallets, wallets))
+            total, markets, internal, volume = cur.fetchone()
+            internal_pct = 100.0 * (internal or 0) / max(total or 1, 1)
+            print(
+                f"  #{i}: {len(cluster):4} wallets | "
+                f"{total:>8,} trades | "
+                f"{markets:>5} markets | "
+                f"${float(volume):>14,.0f} | "
+                f"internal {internal_pct:5.1f}%"
+            )
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Run Sirolly wash detection on the trades table")
     p.add_argument(
@@ -61,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--min-cluster-size", type=int, default=3, help="ignore clusters smaller than this"
+    )
+    p.add_argument(
+        "--analyze-top",
+        type=int,
+        default=ANALYZE_TOP_DEFAULT,
+        help=f"after detection, query DB stats for top N clusters (default {ANALYZE_TOP_DEFAULT})",
     )
     args = p.parse_args(argv)
 
@@ -99,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
             sample = ", ".join(sorted(cluster)[:3])
             more = f", +{len(cluster) - 3} more" if len(cluster) > 3 else ""
             print(f"  #{i}: {len(cluster):4} wallets — {sample}{more}")
+
+        if args.analyze_top > 0:
+            analyze_clusters(clusters, args.analyze_top)
 
     return 0
 
