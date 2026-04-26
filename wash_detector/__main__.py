@@ -13,6 +13,7 @@ CLI::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import sys
 import time
 
@@ -22,6 +23,13 @@ from ingestion.db import connect
 from wash_detector.sirolly import run_wash_detection
 
 ANALYZE_TOP_DEFAULT = 5
+CLUSTER_ID_PREFIX = "WASH-"
+
+
+def _cluster_id(cluster: frozenset[str]) -> str:
+    """Deterministic ID for a cluster — same wallet set always maps to the same id."""
+    digest = hashlib.sha1(",".join(sorted(cluster)).encode()).hexdigest()
+    return f"{CLUSTER_ID_PREFIX}{digest[:12]}"
 
 
 def load_trades(limit: int | None) -> pd.DataFrame:
@@ -51,6 +59,110 @@ def load_trades(limit: int | None) -> pd.DataFrame:
     df["price"] = df["price"].astype(float)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     return df
+
+
+def save_clusters(
+    df: pd.DataFrame,
+    clusters: list[frozenset[str]],
+    scores: dict[str, float],
+) -> None:
+    """Persist clusters + memberships + suspect-wallet flags to Postgres.
+
+    Idempotent: re-running produces the same cluster_ids (deterministic hash
+    of sorted wallet list) and ON CONFLICT DO UPDATE refreshes the rows.
+
+    For each cluster we store: total notional volume across cluster trades,
+    aggregate proxy PnL (maker_flow - taker_flow across all cluster-touching
+    trades — captures net cash-out vs the outside world), and confidence_score
+    (mean Sirolly score of members). For each wallet we set is_suspected_wash,
+    wash_score, wash_cluster_id, and seed first/last_seen from the trades window.
+    """
+    if not clusters:
+        return
+    print(f"\nSaving {len(clusters)} clusters to DB...")
+    t0 = time.perf_counter()
+
+    all_wash = {w for c in clusters for w in c}
+    maker_appear = df.loc[df["maker"].isin(all_wash), ["maker", "timestamp"]].rename(
+        columns={"maker": "wallet"}
+    )
+    taker_appear = df.loc[df["taker"].isin(all_wash), ["taker", "timestamp"]].rename(
+        columns={"taker": "wallet"}
+    )
+    seen = (
+        pd.concat([maker_appear, taker_appear], ignore_index=True)
+        .groupby("wallet")["timestamp"]
+        .agg(["min", "max"])
+    )
+
+    notional_all = df["size"] * df["price"]
+
+    insert_cluster_sql = """
+        INSERT INTO wash_clusters
+            (cluster_id, num_wallets, total_volume, aggregate_pnl,
+             first_detected, last_updated, confidence_score)
+        VALUES (%s, %s, %s, %s, NOW(), NOW(), %s)
+        ON CONFLICT (cluster_id) DO UPDATE SET
+            num_wallets      = EXCLUDED.num_wallets,
+            total_volume     = EXCLUDED.total_volume,
+            aggregate_pnl    = EXCLUDED.aggregate_pnl,
+            last_updated     = NOW(),
+            confidence_score = EXCLUDED.confidence_score
+    """
+    upsert_wallet_sql = """
+        INSERT INTO wallets
+            (address, first_seen, last_seen,
+             wash_score, wash_cluster_id, is_suspected_wash)
+        VALUES (%s, %s, %s, %s, %s, TRUE)
+        ON CONFLICT (address) DO UPDATE SET
+            first_seen        = LEAST(wallets.first_seen, EXCLUDED.first_seen),
+            last_seen         = GREATEST(wallets.last_seen, EXCLUDED.last_seen),
+            wash_score        = EXCLUDED.wash_score,
+            wash_cluster_id   = EXCLUDED.wash_cluster_id,
+            is_suspected_wash = TRUE
+    """
+    insert_member_sql = """
+        INSERT INTO wash_cluster_membership (cluster_id, wallet, volume_in_cluster)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (cluster_id, wallet) DO UPDATE SET
+            volume_in_cluster = EXCLUDED.volume_in_cluster
+    """
+
+    with connect() as conn, conn.cursor() as cur:
+        for cluster in clusters:
+            wallet_set = set(cluster)
+            cid = _cluster_id(cluster)
+
+            in_maker = df["maker"].isin(wallet_set)
+            in_taker = df["taker"].isin(wallet_set)
+            touches = in_maker | in_taker
+            notional = notional_all[touches]
+
+            maker_flow = float(notional_all[in_maker].sum())
+            taker_flow = float(notional_all[in_taker].sum())
+            total_volume = float(notional.sum())
+            agg_pnl = maker_flow - taker_flow
+            avg_score = sum(scores.get(w, 0.0) for w in cluster) / len(cluster)
+
+            cur.execute(
+                insert_cluster_sql,
+                (cid, len(cluster), total_volume, agg_pnl, avg_score),
+            )
+
+            wallet_rows = []
+            member_rows = []
+            for w in sorted(cluster):
+                first_seen = seen.at[w, "min"]
+                last_seen = seen.at[w, "max"]
+                wallet_volume = float(notional_all[(df["maker"] == w) | (df["taker"] == w)].sum())
+                wallet_rows.append((w, first_seen, last_seen, scores.get(w, 0.0), cid))
+                member_rows.append((cid, w, wallet_volume))
+            cur.executemany(upsert_wallet_sql, wallet_rows)
+            cur.executemany(insert_member_sql, member_rows)
+        conn.commit()
+
+    t1 = time.perf_counter()
+    print(f"  saved {len(clusters)} clusters / {len(all_wash):,} wallets in {t1 - t0:.1f}s")
 
 
 def analyze_clusters(clusters: list[frozenset[str]], top_n: int) -> None:
@@ -109,6 +221,11 @@ def main(argv: list[str] | None = None) -> int:
         default=ANALYZE_TOP_DEFAULT,
         help=f"after detection, query DB stats for top N clusters (default {ANALYZE_TOP_DEFAULT})",
     )
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="persist clusters + memberships + wallet flags to Postgres",
+    )
     args = p.parse_args(argv)
 
     print(f"Loading trades (limit={args.limit})...")
@@ -149,6 +266,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.analyze_top > 0:
             analyze_clusters(clusters, args.analyze_top)
+
+        if args.save:
+            save_clusters(df, clusters, scores)
 
     return 0
 
