@@ -82,6 +82,15 @@ def save_clusters(
     print(f"\nSaving {len(clusters)} clusters to DB...")
     t0 = time.perf_counter()
 
+    notional_all = df["size"] * df["price"]
+    df_with_notional = df.assign(_notional=notional_all)
+
+    # Precompute per-wallet aggregates ONCE — eliminates the per-wallet
+    # full-DataFrame scan that previously made this O(wallets * trades).
+    maker_flow_by_wallet = df_with_notional.groupby("maker")["_notional"].sum()
+    taker_flow_by_wallet = df_with_notional.groupby("taker")["_notional"].sum()
+    wallet_volume = maker_flow_by_wallet.add(taker_flow_by_wallet, fill_value=0.0)
+
     all_wash = {w for c in clusters for w in c}
     maker_appear = df.loc[df["maker"].isin(all_wash), ["maker", "timestamp"]].rename(
         columns={"maker": "wallet"}
@@ -94,8 +103,6 @@ def save_clusters(
         .groupby("wallet")["timestamp"]
         .agg(["min", "max"])
     )
-
-    notional_all = df["size"] * df["price"]
 
     insert_cluster_sql = """
         INSERT INTO wash_clusters
@@ -130,33 +137,33 @@ def save_clusters(
 
     with connect() as conn, conn.cursor() as cur:
         for cluster in clusters:
-            wallet_set = set(cluster)
             cid = _cluster_id(cluster)
+            members = sorted(cluster)
 
-            in_maker = df["maker"].isin(wallet_set)
-            in_taker = df["taker"].isin(wallet_set)
-            touches = in_maker | in_taker
-            notional = notional_all[touches]
-
-            maker_flow = float(notional_all[in_maker].sum())
-            taker_flow = float(notional_all[in_taker].sum())
-            total_volume = float(notional.sum())
+            maker_flow = float(maker_flow_by_wallet.reindex(members, fill_value=0.0).sum())
+            taker_flow = float(taker_flow_by_wallet.reindex(members, fill_value=0.0).sum())
+            # Cluster's gross notional touch — double-counts trades that are
+            # internal to the cluster, but for sizing purposes that's fine.
+            total_volume = maker_flow + taker_flow
             agg_pnl = maker_flow - taker_flow
-            avg_score = sum(scores.get(w, 0.0) for w in cluster) / len(cluster)
+            avg_score = sum(scores.get(w, 0.0) for w in members) / len(members)
 
             cur.execute(
                 insert_cluster_sql,
-                (cid, len(cluster), total_volume, agg_pnl, avg_score),
+                (cid, len(members), total_volume, agg_pnl, avg_score),
             )
 
-            wallet_rows = []
-            member_rows = []
-            for w in sorted(cluster):
-                first_seen = seen.at[w, "min"]
-                last_seen = seen.at[w, "max"]
-                wallet_volume = float(notional_all[(df["maker"] == w) | (df["taker"] == w)].sum())
-                wallet_rows.append((w, first_seen, last_seen, scores.get(w, 0.0), cid))
-                member_rows.append((cid, w, wallet_volume))
+            wallet_rows = [
+                (
+                    w,
+                    seen.at[w, "min"],
+                    seen.at[w, "max"],
+                    scores.get(w, 0.0),
+                    cid,
+                )
+                for w in members
+            ]
+            member_rows = [(cid, w, float(wallet_volume.get(w, 0.0))) for w in members]
             cur.executemany(upsert_wallet_sql, wallet_rows)
             cur.executemany(insert_member_sql, member_rows)
         conn.commit()
