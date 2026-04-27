@@ -32,7 +32,7 @@ from ingestion.gamma_client import (
 )
 
 BATCH_SIZE_DEFAULT = 500
-REFRESH_WORKERS_DEFAULT = 8
+REFRESH_WORKERS_DEFAULT = 4
 
 UPSERT_SQL = """
 INSERT INTO markets (

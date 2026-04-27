@@ -198,11 +198,18 @@ def _parse_loose_datetime(value: Any) -> Any:
         return value
 
 
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+DEFAULT_RETRIES = 5
+RETRY_BASE_DELAY_SEC = 1.0
+
+
 def fetch_market_by_condition_id(
     condition_id: str,
     *,
     client: httpx.Client | None = None,
     base_url: str | None = None,
+    max_retries: int = DEFAULT_RETRIES,
+    retry_base_delay: float = RETRY_BASE_DELAY_SEC,
 ) -> GammaMarket | None:
     """Look up a single market by condition_id.
 
@@ -210,14 +217,26 @@ def fetch_market_by_condition_id(
     matches, and the array form ``condition_ids[]=A&condition_ids[]=B``
     is ignored entirely. Only the singular form actually filters, so
     we issue one request per ID and let callers parallelise.
+
+    Retries 429/5xx with exponential backoff (1, 2, 4, 8, 16s) so a
+    burst of concurrent requests doesn't crash the whole refresh run.
     """
+    import time as _time
+
     url = (base_url or str(get_settings().polymarket_gamma_api)).rstrip("/") + GAMMA_MARKETS_PATH
     owns_client = client is None
     active_client = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
-        resp = active_client.get(url, params={"condition_ids": condition_id, "limit": 1})
-        if resp.status_code == 422:
-            return None
+        resp: httpx.Response | None = None
+        for attempt in range(max_retries + 1):
+            resp = active_client.get(url, params={"condition_ids": condition_id, "limit": 1})
+            if resp.status_code == 422:
+                return None
+            if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+                _time.sleep(retry_base_delay * (2**attempt))
+                continue
+            break
+        assert resp is not None
         resp.raise_for_status()
         payload = resp.json()
     finally:
