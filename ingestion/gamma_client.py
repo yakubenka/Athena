@@ -198,6 +198,37 @@ def _parse_loose_datetime(value: Any) -> Any:
         return value
 
 
+def fetch_market_by_condition_id(
+    condition_id: str,
+    *,
+    client: httpx.Client | None = None,
+    base_url: str | None = None,
+) -> GammaMarket | None:
+    """Look up a single market by condition_id.
+
+    Polymarket's batch ``condition_ids=A,B,C`` syntax silently returns 0
+    matches, and the array form ``condition_ids[]=A&condition_ids[]=B``
+    is ignored entirely. Only the singular form actually filters, so
+    we issue one request per ID and let callers parallelise.
+    """
+    url = (base_url or str(get_settings().polymarket_gamma_api)).rstrip("/") + GAMMA_MARKETS_PATH
+    owns_client = client is None
+    active_client = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
+    try:
+        resp = active_client.get(url, params={"condition_ids": condition_id, "limit": 1})
+        if resp.status_code == 422:
+            return None
+        resp.raise_for_status()
+        payload = resp.json()
+    finally:
+        if owns_client:
+            active_client.close()
+
+    if not isinstance(payload, list) or not payload:
+        return None
+    return GammaMarket.model_validate(payload[0])
+
+
 def fetch_markets_page(
     *,
     offset: int = 0,

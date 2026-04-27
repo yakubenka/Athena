@@ -17,14 +17,22 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import httpx
 import psycopg
 
 from ingestion.db import connect
-from ingestion.gamma_client import GammaMarket, iter_markets
+from ingestion.gamma_client import (
+    REQUEST_TIMEOUT_SECONDS,
+    GammaMarket,
+    fetch_market_by_condition_id,
+    iter_markets,
+)
 
 BATCH_SIZE_DEFAULT = 500
+REFRESH_WORKERS_DEFAULT = 8
 
 UPSERT_SQL = """
 INSERT INTO markets (
@@ -102,6 +110,49 @@ def upsert_markets(
     return total
 
 
+def iter_markets_from_trades(
+    *,
+    workers: int = REFRESH_WORKERS_DEFAULT,
+    only_unresolved: bool = False,
+) -> Iterator[GammaMarket]:
+    """Fetch one market per ``condition_id`` already present in trades.
+
+    Use this to refresh resolution data on the markets we actually care
+    about, bypassing Gamma's pagination cap and ``closed=true`` filter
+    (which lags UMA resolution by hours-to-days). Concurrency keeps the
+    7k+ sequential round-trips to a few minutes.
+    """
+    sql = "SELECT DISTINCT t.condition_id FROM trades t"
+    if only_unresolved:
+        sql = (
+            "SELECT DISTINCT t.condition_id FROM trades t "
+            "LEFT JOIN markets m ON m.condition_id = t.condition_id "
+            "WHERE m.resolved_outcome IS NULL"
+        )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        ids = [row[0] for row in cur.fetchall()]
+
+    print(f"Refreshing {len(ids):,} markets (workers={workers})...")
+    yielded = 0
+    with (
+        httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS) as client,
+        ThreadPoolExecutor(max_workers=workers) as pool,
+    ):
+        futures = {
+            pool.submit(fetch_market_by_condition_id, cid, client=client): cid for cid in ids
+        }
+        for fut in as_completed(futures):
+            market = fut.result()
+            if market is None:
+                continue
+            yield market
+            yielded += 1
+            if yielded % 500 == 0:
+                print(f"  fetched {yielded:,} / {len(ids):,}")
+    print(f"  fetched {yielded:,} markets total")
+
+
 def _chunked(items: Iterable[GammaMarket], size: int) -> Iterator[list[GammaMarket]]:
     batch: list[GammaMarket] = []
     for item in items:
@@ -139,21 +190,42 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="fetch and parse but do not write to Postgres",
     )
+    p.add_argument(
+        "--from-trades",
+        action="store_true",
+        help="refresh markets we have trades for (bypasses pagination + closed filter)",
+    )
+    p.add_argument(
+        "--only-unresolved",
+        action="store_true",
+        help="when used with --from-trades, skip markets that already have resolved_outcome",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=REFRESH_WORKERS_DEFAULT,
+        help=f"concurrent fetchers for --from-trades (default {REFRESH_WORKERS_DEFAULT})",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_argparser().parse_args(argv)
 
-    closed_arg: bool | None = None
-    if args.closed != "all":
-        closed_arg = args.closed == "true"
-
-    stream = iter_markets(
-        closed=closed_arg,
-        page_size=args.page_size,
-        max_markets=args.limit,
-    )
+    if args.from_trades:
+        stream: Iterable[GammaMarket] = iter_markets_from_trades(
+            workers=args.workers,
+            only_unresolved=args.only_unresolved,
+        )
+    else:
+        closed_arg: bool | None = None
+        if args.closed != "all":
+            closed_arg = args.closed == "true"
+        stream = iter_markets(
+            closed=closed_arg,
+            page_size=args.page_size,
+            max_markets=args.limit,
+        )
 
     if args.dry_run:
         n = sum(1 for _ in stream)
