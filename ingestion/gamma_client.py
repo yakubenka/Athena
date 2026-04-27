@@ -228,15 +228,25 @@ def fetch_market_by_condition_id(
     active_client = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
         resp: httpx.Response | None = None
+        last_exc: Exception | None = None
         for attempt in range(max_retries + 1):
-            resp = active_client.get(url, params={"condition_ids": condition_id, "limit": 1})
+            try:
+                resp = active_client.get(url, params={"condition_ids": condition_id, "limit": 1})
+            except httpx.TransportError as exc:
+                # Network blip (read timeout, connection reset, DNS) — retry.
+                last_exc = exc
+                if attempt >= max_retries:
+                    raise
+                _time.sleep(retry_base_delay * (2**attempt))
+                continue
             if resp.status_code == 422:
                 return None
             if resp.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
                 _time.sleep(retry_base_delay * (2**attempt))
                 continue
             break
-        assert resp is not None
+        if resp is None:  # all attempts hit transport errors
+            raise RuntimeError(f"gamma transport failure on {condition_id}: {last_exc}")
         resp.raise_for_status()
         payload = resp.json()
     finally:

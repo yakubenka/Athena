@@ -142,15 +142,22 @@ def iter_markets_from_trades(
         futures = {
             pool.submit(fetch_market_by_condition_id, cid, client=client): cid for cid in ids
         }
+        errors = 0
         for fut in as_completed(futures):
-            market = fut.result()
+            try:
+                market = fut.result()
+            except Exception as exc:
+                errors += 1
+                cid = futures[fut]
+                print(f"  ! {cid}: {type(exc).__name__}: {exc}")
+                continue
             if market is None:
                 continue
             yield market
             yielded += 1
             if yielded % 500 == 0:
                 print(f"  fetched {yielded:,} / {len(ids):,}")
-    print(f"  fetched {yielded:,} markets total")
+    print(f"  fetched {yielded:,} markets, errors={errors}")
 
 
 def _chunked(items: Iterable[GammaMarket], size: int) -> Iterator[list[GammaMarket]]:
