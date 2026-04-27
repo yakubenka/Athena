@@ -122,17 +122,48 @@ def test_resolution_derived_no_winner() -> None:
 
 
 def test_resolution_skipped_for_voided_market() -> None:
-    """Both prices ~0 => the market was voided; resolved_outcome stays null."""
+    """Both prices ~0 => no winner; the row stays fully null.
+
+    Voided markets refund all USDC, so for PnL purposes they are
+    neither YES nor NO — leaving the resolution columns null lets
+    downstream code treat them the same as any unresolved row.
+    """
     payload = _sample_market(
         closed=True,
         closedTime="2020-11-02T16:31:01+00:00",
         outcomePrices='["0", "0"]',
     )
     market = GammaMarket.model_validate(payload)
-    # We still inherit closed_time as a sort-of resolution timestamp, but
-    # we DO NOT pick a winner — leaves resolved_outcome null.
-    assert market.resolved_at == datetime(2020, 11, 2, 16, 31, 1, tzinfo=UTC)
+    assert market.resolved_at is None
     assert market.resolved_outcome is None
+
+
+def test_resolution_derived_from_prices_when_closed_flag_lags() -> None:
+    """The common Polymarket case: market ended, prices snapped to 1/0,
+    but ``closed`` and ``umaResolutionStatus`` are still pending."""
+    payload = _sample_market(
+        closed=False,
+        closedTime=None,
+        endDate="2026-01-01T00:00:00Z",
+        umaResolutionStatus=None,
+        outcomePrices='["0.0005", "0.9995"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_outcome == "NO"
+    # Falls back to end_date because closedTime isn't set yet.
+    assert market.resolved_at == datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def test_resolution_skipped_when_uma_disputes() -> None:
+    """If UMA is disputing, we don't trust the price even if it's extreme."""
+    payload = _sample_market(
+        closed=False,
+        umaResolutionStatus="disputed",
+        outcomePrices='["1", "0"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_outcome is None
+    assert market.resolved_at is None
 
 
 def test_resolution_skipped_for_open_market() -> None:

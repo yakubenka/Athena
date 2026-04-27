@@ -141,30 +141,43 @@ class GammaMarket(BaseModel):
 
     @model_validator(mode="after")
     def _derive_resolution(self) -> GammaMarket:
-        """Backfill ``resolved_at`` / ``resolved_outcome`` from raw Gamma fields.
+        """Backfill ``resolved_at`` / ``resolved_outcome`` from outcome prices.
 
-        Only applied when the market is actually resolved. Voided / refunded
-        markets (where every outcome price is ~0) intentionally stay null —
-        we don't want to count them as YES or NO wins for PnL purposes.
+        Polymarket's ``closed`` and ``umaResolutionStatus`` flags lag the
+        actual resolution by hours to days — many markets that ended
+        months ago still have ``closed=false``. The operational source of
+        truth is the outcome price: once one side reaches ~1.0 (and the
+        other ~0.0), CTF payouts are determined.
+
+        We derive a winner whenever a clear extreme price exists, EXCEPT
+        when UMA is actively disputing the outcome — in that case we
+        respect the dispute and stay null. Voided markets (every price
+        ~0) also stay null since there is no winner to record.
         """
-        if not self.closed:
-            return self
         if (
             self.uma_resolution_status is not None
-            and self.uma_resolution_status.lower() != "resolved"
+            and self.uma_resolution_status.lower() == "disputed"
         ):
             return self
 
-        if self.resolved_at is None and self.closed_time is not None:
-            self.resolved_at = self.closed_time
-
-        if self.resolved_outcome is None and self.outcomes and self.outcome_prices:
+        winner: str | None = None
+        if self.outcomes and self.outcome_prices:
             for label, price in zip(self.outcomes, self.outcome_prices, strict=False):
                 if price >= RESOLVED_PRICE_THRESHOLD:
                     upper = label.strip().upper()
                     if upper in ("YES", "NO"):
-                        self.resolved_outcome = upper
+                        winner = upper
                     break
+
+        if winner is None:
+            return self
+
+        if self.resolved_outcome is None:
+            self.resolved_outcome = winner
+        if self.resolved_at is None:
+            # closedTime is the most accurate signal; fall back to end_date
+            # for markets that never got formally closed by Polymarket.
+            self.resolved_at = self.closed_time or self.end_date
         return self
 
 
