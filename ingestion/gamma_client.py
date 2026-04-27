@@ -225,6 +225,11 @@ def fetch_markets_page(
     active_client = client if client is not None else httpx.Client(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
         resp = active_client.get(url, params=params)
+        # Polymarket caps offset around ~250k; once you walk past it the
+        # API replies 422 instead of an empty page. Treat that the same
+        # as "no more rows" so callers can rely on the empty-page sentinel.
+        if resp.status_code == 422:
+            return []
         resp.raise_for_status()
         payload = resp.json()
     finally:

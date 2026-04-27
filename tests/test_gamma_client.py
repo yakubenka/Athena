@@ -245,6 +245,20 @@ def test_iter_markets_respects_max_markets() -> None:
     assert len(markets) == 7
 
 
+def test_fetch_page_treats_422_as_end_of_stream() -> None:
+    """Polymarket replies 422 once offset exceeds its internal cap."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, text="offset too large")
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url=BASE_URL)
+    try:
+        result = fetch_markets_page(offset=300_000, limit=500, client=client, base_url=BASE_URL)
+    finally:
+        client.close()
+    assert result == []
+
+
 def test_iter_markets_stops_on_empty_page() -> None:
     responses: list[list[dict[str, Any]]] = [
         [_sample_market(conditionId="0xonly")],

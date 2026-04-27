@@ -84,16 +84,18 @@ def upsert_markets(
 
     def _run(active_conn: psycopg.Connection) -> None:
         nonlocal total
-        with active_conn.cursor() as cur:
-            for batch in _chunked(markets, batch_size):
+        for batch in _chunked(markets, batch_size):
+            with active_conn.cursor() as cur:
                 rows = [market_to_row(m) for m in batch]
                 cur.executemany(UPSERT_SQL, rows)
-                total += len(rows)
+            # Commit per batch so a 30-minute run doesn't lose all
+            # progress when Gamma flakes on the very last page.
+            active_conn.commit()
+            total += len(rows)
 
     if conn is None:
         with connect() as own:
             _run(own)
-            own.commit()
     else:
         _run(conn)
 
