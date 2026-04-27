@@ -157,6 +157,21 @@ def test_resolution_skipped_when_uma_status_is_not_resolved() -> None:
     assert market.resolved_outcome is None
 
 
+def test_closed_time_accepts_postgres_style_timestamp() -> None:
+    """Real Gamma payloads use ``"YYYY-MM-DD HH:MM:SS+00"`` for closedTime,
+    not the ISO ``T`` separator. We must accept both."""
+    payload = _sample_market(
+        closed=True,
+        closedTime="2020-11-02 16:31:01+00",
+        umaResolutionStatus="resolved",
+        outcomePrices='["1", "0"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.closed_time == datetime(2020, 11, 2, 16, 31, 1, tzinfo=UTC)
+    assert market.resolved_at == datetime(2020, 11, 2, 16, 31, 1, tzinfo=UTC)
+    assert market.resolved_outcome == "YES"
+
+
 def test_outcomes_fall_back_when_not_json() -> None:
     market = GammaMarket.model_validate(_sample_market(outcomes=["Yes", "No"]))
     assert market.outcomes == ["Yes", "No"]

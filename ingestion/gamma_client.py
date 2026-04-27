@@ -129,6 +129,16 @@ class GammaMarket(BaseModel):
             return [str(x) for x in parsed]
         return parsed
 
+    @field_validator("closed_time", mode="before")
+    @classmethod
+    def _parse_closed_time(cls, value: Any) -> Any:
+        """Gamma sends ``closedTime`` as ``"2020-11-02 16:31:01+00"`` —
+        space separator, short tz offset — which pydantic refuses. Python's
+        ``fromisoformat`` accepts both that and the standard ISO shape
+        once we normalise the offset.
+        """
+        return _parse_loose_datetime(value)
+
     @model_validator(mode="after")
     def _derive_resolution(self) -> GammaMarket:
         """Backfill ``resolved_at`` / ``resolved_outcome`` from raw Gamma fields.
@@ -166,6 +176,26 @@ def _maybe_parse_json_list(value: Any) -> Any:
         except json.JSONDecodeError:
             return value
     return value
+
+
+def _parse_loose_datetime(value: Any) -> Any:
+    """Best-effort parse for Gamma's loose datetime strings.
+
+    Handles ``"2020-11-02 16:31:01+00"`` (space sep, short tz) by
+    expanding the offset to ``"+00:00"`` so ``datetime.fromisoformat``
+    can take it. Anything we can't normalise is returned unchanged so
+    pydantic's own validator can have its turn (and produce the proper
+    error message).
+    """
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if len(s) >= 3 and s[-3] in ("+", "-") and s[-2:].isdigit():
+        s = s + ":00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return value
 
 
 def fetch_markets_page(
