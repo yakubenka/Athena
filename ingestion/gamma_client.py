@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from config.settings import get_settings
 
@@ -29,6 +29,11 @@ GAMMA_MARKETS_PATH = "/markets"
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
 REQUEST_TIMEOUT_SECONDS = 30.0
+
+# A winning outcome's price in a resolved binary market is approximately 1.0;
+# the loser's is approximately 0.0. Floating-point noise from the API
+# justifies a small tolerance.
+RESOLVED_PRICE_THRESHOLD = 0.99
 
 
 class GammaMarket(BaseModel):
@@ -65,10 +70,20 @@ class GammaMarket(BaseModel):
     outcomes: list[str] = Field(default_factory=list)
     outcome_prices: list[float] = Field(default_factory=list, alias="outcomePrices")
 
-    # Present only on resolved markets. Field names vary by API version;
-    # we accept both spellings via aliases and fall back to None.
+    # Polymarket's Gamma API does NOT actually expose ``resolvedAt`` /
+    # ``resolvedOutcome`` keys. The resolution signal lives in:
+    # - ``closedTime`` (timestamp the market was closed/resolved)
+    # - ``umaResolutionStatus`` ("resolved" once UMA has finalised it)
+    # - ``outcomePrices`` (winner has price ~1.0, loser ~0.0)
+    # We keep the typed ``resolved_at`` / ``resolved_outcome`` fields as
+    # the public surface and derive them in ``_derive_resolution`` below.
+    # The aliases stay so a future API revision that adds the explicit
+    # keys would Just Work.
     resolved_at: datetime | None = Field(default=None, alias="resolvedAt")
     resolved_outcome: str | None = Field(default=None, alias="resolvedOutcome")
+
+    closed_time: datetime | None = Field(default=None, alias="closedTime")
+    uma_resolution_status: str | None = Field(default=None, alias="umaResolutionStatus")
 
     # Multi-option scalar markets use negRisk; regular YES/NO markets don't.
     # We keep the flag so the ingestion layer can filter if desired.
@@ -113,6 +128,34 @@ class GammaMarket(BaseModel):
         if isinstance(parsed, list):
             return [str(x) for x in parsed]
         return parsed
+
+    @model_validator(mode="after")
+    def _derive_resolution(self) -> GammaMarket:
+        """Backfill ``resolved_at`` / ``resolved_outcome`` from raw Gamma fields.
+
+        Only applied when the market is actually resolved. Voided / refunded
+        markets (where every outcome price is ~0) intentionally stay null —
+        we don't want to count them as YES or NO wins for PnL purposes.
+        """
+        if not self.closed:
+            return self
+        if (
+            self.uma_resolution_status is not None
+            and self.uma_resolution_status.lower() != "resolved"
+        ):
+            return self
+
+        if self.resolved_at is None and self.closed_time is not None:
+            self.resolved_at = self.closed_time
+
+        if self.resolved_outcome is None and self.outcomes and self.outcome_prices:
+            for label, price in zip(self.outcomes, self.outcome_prices, strict=False):
+                if price >= RESOLVED_PRICE_THRESHOLD:
+                    upper = label.strip().upper()
+                    if upper in ("YES", "NO"):
+                        self.resolved_outcome = upper
+                    break
+        return self
 
 
 def _maybe_parse_json_list(value: Any) -> Any:

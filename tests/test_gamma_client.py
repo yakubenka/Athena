@@ -97,6 +97,66 @@ def test_resolved_fields_parse_when_present() -> None:
     assert market.resolved_at == datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 
 
+def test_resolution_derived_from_gamma_fields_yes_winner() -> None:
+    """Realistic Gamma payload: closedTime + outcomePrices + umaResolutionStatus."""
+    payload = _sample_market(
+        closed=True,
+        closedTime="2026-04-27T05:06:32+00:00",
+        umaResolutionStatus="resolved",
+        outcomePrices='["1", "0"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_at == datetime(2026, 4, 27, 5, 6, 32, tzinfo=UTC)
+    assert market.resolved_outcome == "YES"
+
+
+def test_resolution_derived_no_winner() -> None:
+    payload = _sample_market(
+        closed=True,
+        closedTime="2026-04-27T05:06:32+00:00",
+        umaResolutionStatus="resolved",
+        outcomePrices='["0", "1"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_outcome == "NO"
+
+
+def test_resolution_skipped_for_voided_market() -> None:
+    """Both prices ~0 => the market was voided; resolved_outcome stays null."""
+    payload = _sample_market(
+        closed=True,
+        closedTime="2020-11-02T16:31:01+00:00",
+        outcomePrices='["0", "0"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    # We still inherit closed_time as a sort-of resolution timestamp, but
+    # we DO NOT pick a winner — leaves resolved_outcome null.
+    assert market.resolved_at == datetime(2020, 11, 2, 16, 31, 1, tzinfo=UTC)
+    assert market.resolved_outcome is None
+
+
+def test_resolution_skipped_for_open_market() -> None:
+    payload = _sample_market(
+        closed=False,
+        closedTime=None,
+        outcomePrices='["0.6", "0.4"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_at is None
+    assert market.resolved_outcome is None
+
+
+def test_resolution_skipped_when_uma_status_is_not_resolved() -> None:
+    payload = _sample_market(
+        closed=True,
+        closedTime="2026-04-27T05:06:32+00:00",
+        umaResolutionStatus="disputed",
+        outcomePrices='["1", "0"]',
+    )
+    market = GammaMarket.model_validate(payload)
+    assert market.resolved_outcome is None
+
+
 def test_outcomes_fall_back_when_not_json() -> None:
     market = GammaMarket.model_validate(_sample_market(outcomes=["Yes", "No"]))
     assert market.outcomes == ["Yes", "No"]
