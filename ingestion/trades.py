@@ -48,6 +48,12 @@ DEFAULT_CHUNK_SIZE = 2_000
 DEFAULT_DB_BATCH_SIZE = 500
 DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC = 0.05  # polite pause to stay under RPC rate limits
 
+# Watch-mode tunables. Polygon averages ~2.1s/block, so a 30-second poll
+# checks ~14 fresh blocks per cycle. We trail the head by a few
+# confirmations to avoid pulling logs from a block that gets reorged.
+DEFAULT_WATCH_POLL_SEC = 30.0
+DEFAULT_WATCH_CONFIRMATIONS = 3
+
 # Polygon averages ~2.1 seconds per block historically. Using this to
 # approximate block timestamps lets us skip per-block eth_getBlockByNumber
 # calls entirely — critical for free-tier RPC providers that rate-limit
@@ -257,8 +263,17 @@ def backfill(
     max_blocks: int | None = None,
     sleep_between_chunks: float = DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC,
     progress_every: int = 10,
+    watch: bool = False,
+    poll_interval_sec: float = DEFAULT_WATCH_POLL_SEC,
+    confirmations: int = DEFAULT_WATCH_CONFIRMATIONS,
 ) -> BackfillProgress:
-    """Run the backfill loop. Returns a progress summary."""
+    """Run the backfill loop. Returns a progress summary.
+
+    With ``watch=True`` the function keeps running after the initial
+    catch-up: every ``poll_interval_sec`` it asks the RPC for the new head,
+    waits for ``confirmations`` blocks to bury the tip (cheap reorg
+    protection), and ingests anything new. Stops on Ctrl+C.
+    """
     with connect() as conn:
         token_index = load_token_index(conn)
         if not token_index:
@@ -284,25 +299,61 @@ def backfill(
                 f"ts-mode=approximate)"
             )
 
-            while cursor <= end_block:
-                chunk_end = min(cursor + chunk_size - 1, end_block)
-                seen, written = process_chunk(
-                    cursor, chunk_end, token_index, conn, http_client, timestamp_fn
+            cursor, run_chunks, run_seen, run_written = _process_range(
+                cursor=cursor,
+                end_block=end_block,
+                start_block=resume_from,
+                chunk_size=chunk_size,
+                token_index=token_index,
+                conn=conn,
+                http_client=http_client,
+                timestamp_fn=timestamp_fn,
+                sleep_between_chunks=sleep_between_chunks,
+                progress_every=progress_every,
+            )
+            chunks += run_chunks
+            logs_seen += run_seen
+            trades_written += run_written
+
+            if watch:
+                print(
+                    f"Catch-up done at block {cursor - 1:,}. "
+                    f"Entering watch mode (poll={poll_interval_sec:.0f}s, "
+                    f"confirmations={confirmations}). Ctrl+C to stop."
                 )
-                logs_seen += seen
-                trades_written += written
-                chunks += 1
-
-                if chunks % progress_every == 0:
-                    pct = (chunk_end - resume_from) / max(end_block - resume_from, 1) * 100
-                    print(
-                        f"  block {chunk_end:,} [{pct:5.1f}%] "
-                        f"chunks={chunks} seen={logs_seen:,} written={trades_written:,}"
-                    )
-
-                cursor = chunk_end + 1
-                if sleep_between_chunks > 0:
-                    time.sleep(sleep_between_chunks)
+                try:
+                    while True:
+                        time.sleep(poll_interval_sec)
+                        try:
+                            head = get_latest_block(client=http_client)
+                        except RuntimeError as exc:
+                            print(f"  ! head fetch failed: {exc}; will retry next tick")
+                            continue
+                        target = head - confirmations
+                        if target < cursor:
+                            continue  # nothing safely buried yet
+                        cursor, run_chunks, run_seen, run_written = _process_range(
+                            cursor=cursor,
+                            end_block=target,
+                            start_block=cursor,
+                            chunk_size=chunk_size,
+                            token_index=token_index,
+                            conn=conn,
+                            http_client=http_client,
+                            timestamp_fn=timestamp_fn,
+                            sleep_between_chunks=sleep_between_chunks,
+                            progress_every=progress_every,
+                        )
+                        chunks += run_chunks
+                        logs_seen += run_seen
+                        trades_written += run_written
+                        if run_written > 0:
+                            print(
+                                f"  watch tick: head={head:,} cursor={cursor - 1:,} "
+                                f"+{run_written} trades"
+                            )
+                except KeyboardInterrupt:
+                    print("\nstopping watch loop on Ctrl+C")
 
             last_block = cursor - 1
 
@@ -311,6 +362,44 @@ def backfill(
             f"trades_written={trades_written:,} last_block={last_block:,}"
         )
         return BackfillProgress(chunks, logs_seen, trades_written, last_block)
+
+
+def _process_range(
+    *,
+    cursor: int,
+    end_block: int,
+    start_block: int,
+    chunk_size: int,
+    token_index: dict[str, tuple[str, str]],
+    conn: psycopg.Connection,
+    http_client: httpx.Client,
+    timestamp_fn: Callable[[int], datetime],
+    sleep_between_chunks: float,
+    progress_every: int,
+) -> tuple[int, int, int, int]:
+    """Walk ``[cursor, end_block]`` in chunks. Returns the new cursor + counters."""
+    chunks = logs_seen = trades_written = 0
+    while cursor <= end_block:
+        chunk_end = min(cursor + chunk_size - 1, end_block)
+        seen, written = process_chunk(
+            cursor, chunk_end, token_index, conn, http_client, timestamp_fn
+        )
+        logs_seen += seen
+        trades_written += written
+        chunks += 1
+
+        if progress_every and chunks % progress_every == 0:
+            denom = max(end_block - start_block, 1)
+            pct = (chunk_end - start_block) / denom * 100
+            print(
+                f"  block {chunk_end:,} [{pct:5.1f}%] "
+                f"chunks={chunks} seen={logs_seen:,} written={trades_written:,}"
+            )
+
+        cursor = chunk_end + 1
+        if sleep_between_chunks > 0:
+            time.sleep(sleep_between_chunks)
+    return cursor, chunks, logs_seen, trades_written
 
 
 def _build_argparser() -> argparse.ArgumentParser:
@@ -345,6 +434,23 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_SLEEP_BETWEEN_CHUNKS_SEC,
         help="seconds to sleep between chunks (rate-limit politeness)",
     )
+    p.add_argument(
+        "--watch",
+        action="store_true",
+        help="after catch-up, keep polling for new blocks (Ctrl+C to stop)",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_WATCH_POLL_SEC,
+        help=f"seconds between watch-mode polls (default {int(DEFAULT_WATCH_POLL_SEC)})",
+    )
+    p.add_argument(
+        "--confirmations",
+        type=int,
+        default=DEFAULT_WATCH_CONFIRMATIONS,
+        help=f"blocks to trail head in watch mode (default {DEFAULT_WATCH_CONFIRMATIONS})",
+    )
     return p
 
 
@@ -356,6 +462,9 @@ def main(argv: list[str] | None = None) -> int:
         chunk_size=args.chunk_size,
         max_blocks=args.max_blocks,
         sleep_between_chunks=args.sleep,
+        watch=args.watch,
+        poll_interval_sec=args.poll_interval,
+        confirmations=args.confirmations,
     )
     return 0
 
