@@ -7,6 +7,7 @@ import re
 import sys
 from datetime import UTC, datetime, timedelta
 
+from alerts import send_signal
 from ingestion.db import connect
 
 DEFAULT_LOOKBACK = timedelta(hours=1)
@@ -111,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--dry-run", action="store_true", help="don't insert into signals table")
     p.add_argument("--limit", type=int, default=None, help="cap output rows")
+    p.add_argument(
+        "--telegram",
+        action="store_true",
+        help="also push each emitted signal to Telegram (requires TELEGRAM_* in .env)",
+    )
     args = p.parse_args(argv)
 
     since = parse_since(args.since)
@@ -154,6 +160,17 @@ def main(argv: list[str] | None = None) -> int:
                     _signal_strength(float(row["price"])),
                 ),
             )
+            if args.telegram:
+                send_signal(
+                    wallet=str(row["wallet"]),
+                    wallet_tier=str(row["wallet_tier"]) if row["wallet_tier"] else None,
+                    market_question=str(row["question"] or row["condition_id"]),
+                    outcome=str(row["outcome"]),
+                    side=str(side),
+                    price=float(row["price"]),
+                    size=float(row["size"]),
+                    trade_timestamp=row["trade_timestamp"],
+                )
         conn.commit()
 
     print(f"\ninserted {len(rows)} signals.")
