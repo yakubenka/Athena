@@ -15,6 +15,10 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # Empty env vars (e.g. ``FOO=`` left over from a previous
+        # ``set -a; source .env`` with placeholder lines) shadow the
+        # real values in ``.env`` otherwise.
+        env_ignore_empty=True,
     )
 
     database_url: PostgresDsn
