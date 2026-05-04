@@ -332,18 +332,25 @@ def backfill(
                         target = head - confirmations
                         if target < cursor:
                             continue  # nothing safely buried yet
-                        cursor, run_chunks, run_seen, run_written = _process_range(
-                            cursor=cursor,
-                            end_block=target,
-                            start_block=cursor,
-                            chunk_size=chunk_size,
-                            token_index=token_index,
-                            conn=conn,
-                            http_client=http_client,
-                            timestamp_fn=timestamp_fn,
-                            sleep_between_chunks=sleep_between_chunks,
-                            progress_every=progress_every,
-                        )
+                        try:
+                            cursor, run_chunks, run_seen, run_written = _process_range(
+                                cursor=cursor,
+                                end_block=target,
+                                start_block=cursor,
+                                chunk_size=chunk_size,
+                                token_index=token_index,
+                                conn=conn,
+                                http_client=http_client,
+                                timestamp_fn=timestamp_fn,
+                                sleep_between_chunks=sleep_between_chunks,
+                                progress_every=progress_every,
+                            )
+                        except RuntimeError as exc:
+                            # An RPC failure in the middle of a tick — log and try
+                            # again next poll. The cursor is preserved at the
+                            # last successful chunk thanks to per-chunk commits.
+                            print(f"  ! tick failed at cursor {cursor:,}: {exc}")
+                            continue
                         chunks += run_chunks
                         logs_seen += run_seen
                         trades_written += run_written

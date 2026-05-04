@@ -22,9 +22,12 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 MAX_BATCH_SIZE = 1000  # JSON-RPC batch cap tolerated by Alchemy and most nodes
 
 # Transient server/rate-limit errors we retry with exponential backoff.
-# Size-related 400s are handled separately by the adaptive-split code in
-# ingestion.trades because they need a smaller range, not a retry.
-RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+# 408 (timeout), 410 (e.g. drpc "GRPC Context cancellation") and the
+# 5xx family are all transient — Alchemy / drpc push through these
+# under load. Size-related 400s are handled separately by the
+# adaptive-split code in ingestion.trades because they need a smaller
+# range, not a retry.
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({408, 410, 429, 500, 502, 503, 504})
 DEFAULT_RETRIES = 5
 RETRY_BASE_DELAY_SEC = 1.0  # doubles each attempt: 1s, 2s, 4s, 8s, 16s
 
