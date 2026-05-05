@@ -214,6 +214,22 @@ def main(argv: list[str] | None = None) -> int:
 
         if not rows:
             print("  no new signals.")
+            if args.push_prometheus:
+                # Even with no fresh deltas, refresh Prometheus's view of the
+                # watchlist profile so it always has the latest tier-S roster
+                # to consume on its next scan tick.
+                cur.execute(WATCHLIST_PROFILES_SQL)
+                pcols = [d.name for d in cur.description]
+                profiles = [dict(zip(pcols, r, strict=True)) for r in cur.fetchall()]
+                payload = build_prometheus_payload([], profiles)
+                ok = push_smart_money(payload)
+                if ok:
+                    print(
+                        f"  pushed watchlist snapshot ({len(profiles)} traders) "
+                        "with no new signals."
+                    )
+                else:
+                    print("  Prometheus credentials missing — skipped push.")
             return 0
 
         for row in rows:
