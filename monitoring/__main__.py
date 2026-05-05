@@ -108,12 +108,13 @@ WATCHLIST_PROFILES_SQL = """
 SELECT
     w.address,
     w.tier,
-    w.total_volume,
-    w.total_trades,
+    wal.total_volume,
+    wal.total_trades,
     wm.frac_maker_volume,
     wm.counterparty_hhi,
     wm.max_consecutive_5k_plus_months
 FROM watchlist w
+JOIN wallets wal ON wal.address = w.address
 LEFT JOIN wallet_metrics wm ON wm.address = w.address
 WHERE w.copy_enabled = TRUE
 ORDER BY w.address
