@@ -5,11 +5,19 @@
 
 set -euo pipefail
 
-cd /Users/yakubenka/Documents/Athena
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Resolve the project root from the script location so the same file works
+# locally on macOS (where the repo lives in ~/Documents/Athena) and inside
+# the Railway container (where it's at /app).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+# Local dev sources .env; on Railway the env vars are injected directly.
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] athena-monitor: starting loop"
 

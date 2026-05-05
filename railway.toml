@@ -1,0 +1,8 @@
+# Railway build config — Docker image used by both Athena services.
+# Each service in the Railway project overrides the start command.
+
+[build]
+builder = "dockerfile"
+
+[deploy]
+restartPolicyType = "always"

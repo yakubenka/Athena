@@ -140,6 +140,20 @@ def load_token_index(conn: psycopg.Connection) -> dict[str, tuple[str, str]]:
     return index
 
 
+def load_watchlist_addresses(conn: psycopg.Connection) -> frozenset[str]:
+    """Load the lower-cased addresses of every watchlist row.
+
+    Production deployments only care about trades where one side is on
+    our watchlist — filtering here cuts DB writes by ~99% on a busy
+    contract while still reading every log from the RPC (we need the
+    full stream to know when a watched wallet shows up).
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT address FROM watchlist")
+        rows = cur.fetchall()
+    return frozenset(row[0].lower() for row in rows)
+
+
 def get_resume_block(conn: psycopg.Connection, default_start: int) -> int:
     """Return the next block to process — MAX(block_number) + 1, or default."""
     with conn.cursor() as cur:
@@ -229,10 +243,15 @@ def process_chunk(
     conn: psycopg.Connection,
     http_client: httpx.Client,
     timestamp_fn: Callable[[int], datetime],
+    watchlist: frozenset[str] | None = None,
 ) -> tuple[int, int]:
     """Fetch logs in [from_block, to_block], decode, upsert. Returns (seen, written).
 
     ``timestamp_fn`` maps a block number to its (approximate) wall-clock time.
+    ``watchlist`` (optional) — when supplied, only trades where the maker or
+    taker is in the set get persisted. RPC traffic is unchanged; DB writes
+    drop dramatically. Pass ``None`` to record every decoded trade
+    (research/backfill mode).
     """
     logs = _fetch_logs_with_adaptive_split(from_block, to_block, http_client)
     if not logs:
@@ -245,8 +264,13 @@ def process_chunk(
         except ValueError:
             # Malformed event (shouldn't happen if topic0 is correct) — skip.
             continue
-        if trade is not None:
-            decoded.append(trade)
+        if trade is None:
+            continue
+        if watchlist is not None and (
+            trade.maker_address not in watchlist and trade.taker_address not in watchlist
+        ):
+            continue
+        decoded.append(trade)
 
     if not decoded:
         return (len(logs), 0)
@@ -281,6 +305,7 @@ def backfill(
     watch: bool = False,
     poll_interval_sec: float = DEFAULT_WATCH_POLL_SEC,
     confirmations: int = DEFAULT_WATCH_CONFIRMATIONS,
+    only_watchlist: bool = False,
 ) -> BackfillProgress:
     """Run the backfill loop. Returns a progress summary.
 
@@ -288,11 +313,23 @@ def backfill(
     catch-up: every ``poll_interval_sec`` it asks the RPC for the new head,
     waits for ``confirmations`` blocks to bury the tip (cheap reorg
     protection), and ingests anything new. Stops on Ctrl+C.
+
+    With ``only_watchlist=True`` the chunk processor drops trades whose
+    maker and taker are both outside the watchlist table — production
+    cloud deployments only need watched-wallet activity, which keeps the
+    DB tiny and writes near-zero on quiet ticks.
     """
     with connect() as conn:
         token_index = load_token_index(conn)
         if not token_index:
             raise RuntimeError("No token IDs in markets — run `python -m ingestion.markets` first.")
+        watchlist: frozenset[str] | None = None
+        if only_watchlist:
+            watchlist = load_watchlist_addresses(conn)
+            if not watchlist:
+                raise RuntimeError(
+                    "--only-watchlist set but the watchlist table is empty. Seed it before running."
+                )
         resume_from = (
             from_block if from_block is not None else get_resume_block(conn, DEFAULT_START_BLOCK)
         )
@@ -307,11 +344,16 @@ def backfill(
             chunks = logs_seen = trades_written = 0
             cursor = resume_from
 
+            mode_tag = (
+                f"watchlist-only ({len(watchlist):,} addrs)"
+                if watchlist is not None
+                else "all-trades"
+            )
             print(
                 f"Backfill: blocks {resume_from:,} -> {end_block:,} "
                 f"({end_block - resume_from + 1:,} blocks, "
                 f"chunk={chunk_size}, known tokens={len(token_index):,}, "
-                f"ts-mode=approximate)"
+                f"mode={mode_tag})"
             )
 
             cursor, run_chunks, run_seen, run_written = _process_range(
@@ -325,6 +367,7 @@ def backfill(
                 timestamp_fn=timestamp_fn,
                 sleep_between_chunks=sleep_between_chunks,
                 progress_every=progress_every,
+                watchlist=watchlist,
             )
             chunks += run_chunks
             logs_seen += run_seen
@@ -359,6 +402,7 @@ def backfill(
                                 timestamp_fn=timestamp_fn,
                                 sleep_between_chunks=sleep_between_chunks,
                                 progress_every=progress_every,
+                                watchlist=watchlist,
                             )
                         except RuntimeError as exc:
                             # An RPC failure in the middle of a tick — log and try
@@ -398,13 +442,20 @@ def _process_range(
     timestamp_fn: Callable[[int], datetime],
     sleep_between_chunks: float,
     progress_every: int,
+    watchlist: frozenset[str] | None = None,
 ) -> tuple[int, int, int, int]:
     """Walk ``[cursor, end_block]`` in chunks. Returns the new cursor + counters."""
     chunks = logs_seen = trades_written = 0
     while cursor <= end_block:
         chunk_end = min(cursor + chunk_size - 1, end_block)
         seen, written = process_chunk(
-            cursor, chunk_end, token_index, conn, http_client, timestamp_fn
+            cursor,
+            chunk_end,
+            token_index,
+            conn,
+            http_client,
+            timestamp_fn,
+            watchlist=watchlist,
         )
         logs_seen += seen
         trades_written += written
@@ -473,6 +524,14 @@ def _build_argparser() -> argparse.ArgumentParser:
         default=DEFAULT_WATCH_CONFIRMATIONS,
         help=f"blocks to trail head in watch mode (default {DEFAULT_WATCH_CONFIRMATIONS})",
     )
+    p.add_argument(
+        "--only-watchlist",
+        action="store_true",
+        help=(
+            "only persist trades that touch a watchlist address — recommended "
+            "for cloud / production deployments where the DB stays small"
+        ),
+    )
     return p
 
 
@@ -487,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
         watch=args.watch,
         poll_interval_sec=args.poll_interval,
         confirmations=args.confirmations,
+        only_watchlist=args.only_watchlist,
     )
     return 0
 
