@@ -47,10 +47,21 @@ INSERT INTO signals (
     outcome, taker_side, role,
     price, size,
     detected_at, trade_timestamp,
-    latency_seconds, signal_strength
+    latency_seconds, signal_strength,
+    signal_type, source
 )
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, 'athena')
 """
+
+# Map a watchlist trade direction to our copy semantics. When a watched
+# wallet BUYs the outcome they're entering — Prometheus should open a
+# matching position. When they SELL, that's an exit signal — Prometheus
+# should close any open copy on the same condition_id from this source.
+SIGNAL_TYPE_BY_SIDE = {"BUY": "entry", "SELL": "exit"}
+
+
+def _signal_type(side: str) -> str:
+    return SIGNAL_TYPE_BY_SIDE.get(side, "entry")
 
 
 def parse_since(since: str | None) -> datetime:
@@ -142,6 +153,7 @@ def build_prometheus_payload(
                 "market_question": s.get("question") or s["condition_id"],
                 "outcome": s["outcome"],
                 "side": side,
+                "signal_type": _signal_type(side),  # entry on BUY, exit on SELL
                 "price": float(s["price"]),
                 "size": float(s["size"]),
                 "trade_timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
@@ -177,6 +189,7 @@ def build_prometheus_payload(
 
     return {
         "updated_at": datetime.now(UTC).isoformat(),
+        "source": "athena",  # Prometheus filters / dashboards by this tag
         "traders": traders,
     }
 
@@ -257,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
                     row["trade_timestamp"],
                     latency,
                     _signal_strength(float(row["price"])),
+                    _signal_type(side),
                 ),
             )
             if args.telegram:

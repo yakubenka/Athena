@@ -251,9 +251,16 @@ CREATE TABLE IF NOT EXISTS signals (
     is_optimism_extraction BOOLEAN,
     is_counter_flow BOOLEAN,
     signal_strength VARCHAR(20),
+    signal_type VARCHAR(10) DEFAULT 'entry',  -- 'entry' (BUY) or 'exit' (SELL)
+    source VARCHAR(20) DEFAULT 'athena',       -- which subsystem produced this
     detected_at TIMESTAMPTZ DEFAULT NOW(),
     trade_timestamp TIMESTAMPTZ,
     latency_seconds INT,
     action_taken VARCHAR(50),
     prometheus_trade_id BIGINT
 );
+
+-- Backfill the new columns on existing rows so legacy ingests don't show
+-- as NULL on dashboards.
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS signal_type VARCHAR(10) DEFAULT 'entry';
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS source VARCHAR(20) DEFAULT 'athena';
