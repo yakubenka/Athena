@@ -46,7 +46,7 @@ psql "$DATABASE_URL" -At >> "$OUT" <<'EOF'
 
 -- wallets: keep watchlist members + every wallet flagged in any wash cluster.
 SELECT format(
-    'INSERT INTO wallets VALUES (%L,%L,%L,%s,%s,%s,%s,%s,%s,%L,%L,%s,%s,%L,%L,%L,%L,%s,%L) ON CONFLICT (address) DO NOTHING;',
+    'INSERT INTO wallets (address, first_seen, last_seen, total_volume, total_trades, total_maker_volume, total_taker_volume, total_maker_trades, total_taker_trades, proxy_wallet, label, tier, wash_score, wash_cluster_id, is_suspected_wash, consecutive_profitable_months, max_consecutive_5k_months, notes) VALUES (%L,%L,%L,%s,%s,%s,%s,%s,%s,%L,%L,%L,%s,%L,%s,%s,%s,%L) ON CONFLICT (address) DO NOTHING;',
     address, first_seen, last_seen,
     COALESCE(total_volume::text, 'NULL'),
     COALESCE(total_trades::text, 'NULL'),
@@ -54,12 +54,12 @@ SELECT format(
     COALESCE(total_taker_volume::text, 'NULL'),
     COALESCE(total_maker_trades::text, 'NULL'),
     COALESCE(total_taker_trades::text, 'NULL'),
-    proxy_wallet, label, '0', '0',
-    NULL,
+    proxy_wallet, label, tier,
+    COALESCE(wash_score::text, 'NULL'),
     wash_cluster_id,
-    NULL,
-    tier,
-    COALESCE(consecutive_profitable_months::text, '0'),
+    COALESCE(is_suspected_wash::text, 'NULL'),
+    COALESCE(consecutive_profitable_months::text, 'NULL'),
+    COALESCE(max_consecutive_5k_months::text, 'NULL'),
     notes
 )
 FROM wallets
