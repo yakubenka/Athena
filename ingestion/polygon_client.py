@@ -115,14 +115,20 @@ def get_latest_block(*, client: httpx.Client | None = None, url: str | None = No
 
 def get_logs(
     *,
-    contract: str,
-    topic0: str,
+    contract: str | list[str],
+    topic0: str | list[str],
     from_block: int,
     to_block: int,
     client: httpx.Client | None = None,
     url: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch logs from ``contract`` with the given topic0 in [from_block, to_block]."""
+    """Fetch logs from one or more contracts with one or more topic0s.
+
+    ``contract`` and ``topic0`` may each be a single string (1:1 with v1
+    behaviour) or a list (e.g. to query both v1 + v2 exchanges in one call).
+    eth_getLogs natively supports both shapes for ``address`` and the
+    ``topics[0]`` slot.
+    """
     if from_block < 0 or to_block < from_block:
         raise ValueError(f"bad block range [{from_block}, {to_block}]")
     result = rpc_call(

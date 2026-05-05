@@ -29,8 +29,12 @@ import psycopg
 
 from ingestion.db import connect
 from ingestion.orderfilled import (
-    CTF_EXCHANGE_ADDRESS,
-    ORDER_FILLED_TOPIC0,
+    CTF_EXCHANGE_ADDRESS_V1,
+    CTF_EXCHANGE_ADDRESS_V2,
+    NEG_RISK_CTF_EXCHANGE_ADDRESS_V1,
+    NEG_RISK_CTF_EXCHANGE_ADDRESS_V2,
+    ORDER_FILLED_TOPIC0_V1,
+    ORDER_FILLED_TOPIC0_V2,
     DecodedTrade,
     decode_order_filled_log,
 )
@@ -40,6 +44,17 @@ from ingestion.polygon_client import (
     get_logs,
     rpc_call,
 )
+
+# Query all four exchange contracts and both topic0 hashes in one call.
+# Polymarket's v1 contracts are mostly silent now but still emit the
+# occasional event; v2 is where current activity lives.
+TRADE_CONTRACT_ADDRESSES: list[str] = [
+    CTF_EXCHANGE_ADDRESS_V1,
+    NEG_RISK_CTF_EXCHANGE_ADDRESS_V1,
+    CTF_EXCHANGE_ADDRESS_V2,
+    NEG_RISK_CTF_EXCHANGE_ADDRESS_V2,
+]
+TRADE_EVENT_TOPICS: list[str] = [ORDER_FILLED_TOPIC0_V1, ORDER_FILLED_TOPIC0_V2]
 
 # Polymarket CTFExchange was deployed around block 28_000_000 on Polygon.
 # Used as the default --from-block when resuming from scratch.
@@ -174,8 +189,8 @@ def _fetch_logs_with_adaptive_split(
     """
     try:
         return get_logs(
-            contract=CTF_EXCHANGE_ADDRESS,
-            topic0=ORDER_FILLED_TOPIC0,
+            contract=TRADE_CONTRACT_ADDRESSES,
+            topic0=TRADE_EVENT_TOPICS,
             from_block=from_block,
             to_block=to_block,
             client=http_client,
