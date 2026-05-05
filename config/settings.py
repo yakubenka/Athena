@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
 
+    # Prometheus is the existing automated copy-trader. Athena pushes the
+    # curated watchlist + fresh signals to its ``/internal/push`` endpoint
+    # so its smart-money execution path can act on them. Both stay
+    # optional — Athena runs fine in standalone mode if Prometheus isn't
+    # reachable.
+    prometheus_api_url: HttpUrl | None = None
+    prometheus_bot_key: str | None = None
+
     log_level: str = "INFO"
 
     @field_validator(
@@ -37,6 +45,8 @@ class Settings(BaseSettings):
         "dune_api_key",
         "telegram_bot_token",
         "telegram_chat_id",
+        "prometheus_api_url",
+        "prometheus_bot_key",
         mode="before",
     )
     @classmethod

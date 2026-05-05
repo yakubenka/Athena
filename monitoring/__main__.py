@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 from alerts import send_signal
 from ingestion.db import connect
+from prometheus_bridge import push_smart_money
 
 DEFAULT_LOOKBACK = timedelta(hours=1)
 
@@ -103,6 +104,82 @@ def _signal_strength(price: float) -> str:
     return "weak"
 
 
+WATCHLIST_PROFILES_SQL = """
+SELECT
+    w.address,
+    w.tier,
+    w.total_volume,
+    w.total_trades,
+    wm.frac_maker_volume,
+    wm.counterparty_hhi,
+    wm.max_consecutive_5k_plus_months
+FROM watchlist w
+LEFT JOIN wallet_metrics wm ON wm.address = w.address
+WHERE w.copy_enabled = TRUE
+ORDER BY w.address
+"""
+
+
+def build_prometheus_payload(
+    new_signals: list[dict[str, object]],
+    profiles: list[dict[str, object]],
+) -> dict[str, object]:
+    """Shape the payload Prometheus's /internal/push expects.
+
+    ``traders`` is the canonical key (Prometheus's /api/smart_money default
+    response uses it). Each trader carries the lifetime profile plus any
+    fresh signal we just emitted for them in this monitor tick — so
+    Prometheus's strategy can act on the same delta we're acting on.
+    """
+    by_wallet: dict[str, list[dict[str, object]]] = {}
+    for s in new_signals:
+        side = s["taker_side"] if s["role"] == "taker" else _flip(s["taker_side"])
+        ts = s["trade_timestamp"]
+        by_wallet.setdefault(str(s["wallet"]), []).append(
+            {
+                "condition_id": s["condition_id"],
+                "market_question": s.get("question") or s["condition_id"],
+                "outcome": s["outcome"],
+                "side": side,
+                "price": float(s["price"]),
+                "size": float(s["size"]),
+                "trade_timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                "signal_strength": _signal_strength(float(s["price"])),
+            }
+        )
+
+    traders = []
+    for prof in profiles:
+        addr = str(prof["address"])
+        traders.append(
+            {
+                "address": addr,
+                "tier": prof.get("tier"),
+                "total_volume_usd": float(prof["total_volume"] or 0),
+                "total_trades": int(prof["total_trades"] or 0),
+                "frac_maker_volume": (
+                    float(prof["frac_maker_volume"])
+                    if prof.get("frac_maker_volume") is not None
+                    else None
+                ),
+                "counterparty_hhi": (
+                    float(prof["counterparty_hhi"])
+                    if prof.get("counterparty_hhi") is not None
+                    else None
+                ),
+                "max_consecutive_5k_plus_months": int(
+                    prof.get("max_consecutive_5k_plus_months") or 0
+                ),
+                "active_signals": by_wallet.get(addr, []),
+            }
+        )
+
+    return {
+        "updated_at": datetime.now(UTC).isoformat(),
+        "traders": traders,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Emit signals from copy-enabled watchlist trades")
     p.add_argument(
@@ -116,6 +193,11 @@ def main(argv: list[str] | None = None) -> int:
         "--telegram",
         action="store_true",
         help="also push each emitted signal to Telegram (requires TELEGRAM_* in .env)",
+    )
+    p.add_argument(
+        "--push-prometheus",
+        action="store_true",
+        help="also POST the watchlist + new signals to Prometheus /internal/push",
     )
     args = p.parse_args(argv)
 
@@ -172,6 +254,17 @@ def main(argv: list[str] | None = None) -> int:
                     trade_timestamp=row["trade_timestamp"],
                 )
         conn.commit()
+
+        if args.push_prometheus:
+            cur.execute(WATCHLIST_PROFILES_SQL)
+            pcols = [d.name for d in cur.description]
+            profiles = [dict(zip(pcols, r, strict=True)) for r in cur.fetchall()]
+            payload = build_prometheus_payload(rows, profiles)
+            ok = push_smart_money(payload)
+            if ok:
+                print(f"  pushed {len(rows)} signals to Prometheus.")
+            else:
+                print("  Prometheus credentials missing — skipped push.")
 
     print(f"\ninserted {len(rows)} signals.")
     return 0
