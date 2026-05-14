@@ -213,6 +213,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="also POST the watchlist + new signals to Prometheus /internal/push",
     )
+    p.add_argument(
+        "--min-usd",
+        type=float,
+        default=20.0,
+        help=(
+            "drop signals where notional (size * price) is below this many USDC. "
+            "Default 20 — tiny dust trades from watchlist wallets are noise and "
+            "Prometheus rejects them at the order-book level anyway."
+        ),
+    )
     args = p.parse_args(argv)
 
     since = parse_since(args.since)
@@ -222,6 +232,12 @@ def main(argv: list[str] | None = None) -> int:
         cur.execute(FETCH_NEW_SIGNALS_SQL, (since,))
         cols = [d.name for d in cur.description]
         rows = [dict(zip(cols, r, strict=True)) for r in cur.fetchall()]
+
+        if args.min_usd > 0:
+            before = len(rows)
+            rows = [r for r in rows if float(r["size"]) * float(r["price"]) >= args.min_usd]
+            if before > len(rows):
+                print(f"  filtered out {before - len(rows)} dust signals (< ${args.min_usd:.0f})")
 
         if args.limit is not None:
             rows = rows[: args.limit]
